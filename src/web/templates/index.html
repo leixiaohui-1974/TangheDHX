@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tanghe Siphon Autonomous Operation</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f4f7f6; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { background: #2c3e50; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .dashboard { display: grid; grid-template-columns: 250px 1fr; gap: 20px; }
+        .controls { background: white; padding: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .chart-box { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); height: 300px; }
+        .metric { margin-bottom: 15px; }
+        .metric label { display: block; font-size: 0.9em; color: #7f8c8d; }
+        .metric value { display: block; font-size: 1.5em; font-weight: bold; color: #2c3e50; }
+        button { width: 100%; padding: 10px; margin-top: 10px; background: #3498db; color: white; border: none; border-radius: 3px; cursor: pointer; }
+        button:hover { background: #2980b9; }
+        .scenario-btn { background: #95a5a6; margin-top: 5px; }
+        .scenario-btn:hover { background: #7f8c8d; }
+        .active-scen { background: #e74c3c !important; }
+        .status-panel { margin-top: 20px; padding: 10px; background: #ecf0f1; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Tanghe Siphon Digital Twin & Control</h1>
+            <p>L4 Autonomous Operation - Spectral MPC & FIV Suppression</p>
+        </header>
+
+        <div class="dashboard">
+            <div class="controls">
+                <h3>Control Panel</h3>
+
+                <div class="metric">
+                    <label>Target Flow (m³/s)</label>
+                    <input type="number" id="targetFlowInput" value="100" style="width: 100%; padding: 5px; font-size: 1.2em;">
+                    <button onclick="setFlow()">Set Flow</button>
+                </div>
+
+                <hr>
+
+                <h4>Scenarios</h4>
+                <button class="scenario-btn" onclick="setScenario('S1.1')">S1.1 Normal (Balanced)</button>
+                <button class="scenario-btn" onclick="setScenario('S2.1')">S2.1 Resonance Zone</button>
+                <button class="scenario-btn" onclick="setScenario('S4.2')">S4.2 Gate Stuck Fault</button>
+
+                <div class="status-panel">
+                    <h4>System Status</h4>
+                    <div id="statusText">Scenario: None</div>
+                    <div class="metric">
+                        <label>Total Flow</label>
+                        <value id="totalFlowDisplay">0.0</value>
+                    </div>
+                </div>
+            </div>
+
+            <div class="charts">
+                <div class="chart-box">
+                    <canvas id="flowChart"></canvas>
+                </div>
+                <div class="chart-box">
+                    <canvas id="openingChart"></canvas>
+                </div>
+                <div class="chart-box">
+                    <canvas id="vibChart"></canvas>
+                </div>
+                <div class="chart-box">
+                    <canvas id="freqChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
