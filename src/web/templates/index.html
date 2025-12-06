@@ -7,70 +7,110 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f4f7f6; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        header { background: #2c3e50; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .dashboard { display: grid; grid-template-columns: 250px 1fr; gap: 20px; }
-        .controls { background: white; padding: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .chart-box { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); height: 300px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        header { background: #2c3e50; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+        .mode-badge { padding: 5px 15px; border-radius: 15px; font-weight: bold; background: #2ecc71; color: white; }
+        .mode-ROBUST { background: #f1c40f; color: black; }
+        .mode-EMERGENCY { background: #e74c3c; }
+
+        .dashboard { display: grid; grid-template-columns: 300px 1fr 300px; gap: 20px; }
+
+        .panel { background: white; padding: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+
         .metric { margin-bottom: 15px; }
         .metric label { display: block; font-size: 0.9em; color: #7f8c8d; }
         .metric value { display: block; font-size: 1.5em; font-weight: bold; color: #2c3e50; }
+
         button { width: 100%; padding: 10px; margin-top: 10px; background: #3498db; color: white; border: none; border-radius: 3px; cursor: pointer; }
         button:hover { background: #2980b9; }
         .scenario-btn { background: #95a5a6; margin-top: 5px; }
-        .scenario-btn:hover { background: #7f8c8d; }
-        .active-scen { background: #e74c3c !important; }
-        .status-panel { margin-top: 20px; padding: 10px; background: #ecf0f1; border-radius: 5px; }
+        .fault-btn { background: #e67e22; margin-top: 5px; }
+
+        .charts-container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .chart-box { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); height: 250px; }
+
+        .schematic-box { grid-column: 1 / -1; height: 200px; display: flex; justify-content: space-around; align-items: flex-end; padding: 20px; background: #dff9fb; position: relative; }
+
+        .gate-visual { width: 100px; background: #95a5a6; position: relative; border: 2px solid #7f8c8d; transition: height 0.1s; }
+        .gate-water { position: absolute; bottom: 0; left: -10px; right: -10px; background: rgba(52, 152, 219, 0.5); z-index: 1; pointer-events: none; }
+        .gate-label { position: absolute; top: -25px; width: 100%; text-align: center; font-weight: bold; }
+
+        .logs-panel { height: 400px; overflow-y: auto; font-family: monospace; font-size: 0.9em; }
+        .log-entry { padding: 5px; border-bottom: 1px solid #eee; }
+        .log-ALARM { color: #c0392b; font-weight: bold; }
+
+        .scenario-id { background: #34495e; color: #ecf0f1; padding: 10px; text-align: center; border-radius: 5px; margin-bottom: 10px; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>Tanghe Siphon Digital Twin & Control</h1>
-            <p>L4 Autonomous Operation - Spectral MPC & FIV Suppression</p>
+            <div>
+                <h1>Tanghe Siphon Digital Twin</h1>
+                <small>L4 Autonomous Operation System</small>
+            </div>
+            <div id="sysMode" class="mode-badge">NORMAL</div>
         </header>
 
         <div class="dashboard">
-            <div class="controls">
-                <h3>Control Panel</h3>
+            <!-- Left Column: Controls -->
+            <div>
+                <div class="panel">
+                    <h3>Control & Scenarios</h3>
 
-                <div class="metric">
-                    <label>Target Flow (m³/s)</label>
-                    <input type="number" id="targetFlowInput" value="100" style="width: 100%; padding: 5px; font-size: 1.2em;">
-                    <button onclick="setFlow()">Set Flow</button>
+                    <div class="metric">
+                        <label>Target Flow (m³/s)</label>
+                        <input type="number" id="targetFlowInput" value="100" style="width: 100%; padding: 5px; font-size: 1.2em;">
+                        <button onclick="setFlow()">Set Flow</button>
+                    </div>
+
+                    <hr>
+                    <h4>Operational Scenarios</h4>
+                    <button class="scenario-btn" onclick="setScenario('S1.1')">S1.1 Normal (Balanced)</button>
+                    <button class="scenario-btn" onclick="setScenario('S2.1')">S2.1 Resonance Zone</button>
+
+                    <hr>
+                    <h4>Fault Injection</h4>
+                    <button class="fault-btn" onclick="injectFault('trash_rack')">Trigger Trash Rack Blockage</button>
+                    <button class="fault-btn" onclick="injectFault('leakage')">Trigger Seal Leakage</button>
+                    <button class="fault-btn" style="background:#27ae60" onclick="injectFault('clear')">Clear All Faults</button>
                 </div>
 
-                <hr>
-
-                <h4>Scenarios</h4>
-                <button class="scenario-btn" onclick="setScenario('S1.1')">S1.1 Normal (Balanced)</button>
-                <button class="scenario-btn" onclick="setScenario('S2.1')">S2.1 Resonance Zone</button>
-                <button class="scenario-btn" onclick="setScenario('S4.2')">S4.2 Gate Stuck Fault</button>
-
-                <div class="status-panel">
-                    <h4>System Status</h4>
-                    <div id="statusText">Scenario: None</div>
+                <div class="panel">
+                    <h3>System Status</h3>
+                    <div class="metric">
+                        <label>Detected Scenario</label>
+                        <div id="detectedScen" class="scenario-id">Analyzing...</div>
+                    </div>
                     <div class="metric">
                         <label>Total Flow</label>
                         <value id="totalFlowDisplay">0.0</value>
                     </div>
+                    <div class="metric">
+                        <label>Trash Rack Loss</label>
+                        <value id="headLossDisplay">0.0 m</value>
+                    </div>
                 </div>
             </div>
 
-            <div class="charts">
-                <div class="chart-box">
-                    <canvas id="flowChart"></canvas>
-                </div>
-                <div class="chart-box">
-                    <canvas id="openingChart"></canvas>
-                </div>
-                <div class="chart-box">
-                    <canvas id="vibChart"></canvas>
-                </div>
-                <div class="chart-box">
-                    <canvas id="freqChart"></canvas>
-                </div>
+            <!-- Middle Column: Visuals -->
+            <div>
+                 <div class="panel schematic-box" id="gateSchematic">
+                    <!-- Gates will be drawn here by JS -->
+                 </div>
+
+                 <div class="charts-container">
+                    <div class="chart-box"><canvas id="flowChart"></canvas></div>
+                    <div class="chart-box"><canvas id="openingChart"></canvas></div>
+                    <div class="chart-box"><canvas id="vibChart"></canvas></div>
+                    <div class="chart-box"><canvas id="freqChart"></canvas></div>
+                 </div>
+            </div>
+
+            <!-- Right Column: Logs -->
+            <div class="panel logs-panel" id="eventLogs">
+                <h4>Event Log</h4>
+                <!-- Logs here -->
             </div>
         </div>
     </div>
