@@ -22,6 +22,17 @@ from .integrated_controller import (
     MPCConstraints,
     ScenarioControlConfig,
 )
+from .scenario_generator import (
+    FullScenarioGenerator,
+    ScenarioSpec,
+    ScenarioTestRunner,
+    FlowRegime,
+    HeadCondition,
+    VibrationLevel,
+    GateFaultType,
+    SensorFaultType,
+    TransitionPattern,
+)
 
 __all__ = [
     'SpectralMPC',
@@ -41,4 +52,13 @@ __all__ = [
     'MPCObjective',
     'MPCConstraints',
     'ScenarioControlConfig',
+    'FullScenarioGenerator',
+    'ScenarioSpec',
+    'ScenarioTestRunner',
+    'FlowRegime',
+    'HeadCondition',
+    'VibrationLevel',
+    'GateFaultType',
+    'SensorFaultType',
+    'TransitionPattern',
 ]
