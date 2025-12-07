@@ -1213,3 +1213,565 @@ class ScenarioTestRunner:
             'avg_max_flow_error': np.mean([r.metrics['max_flow_error'] for r in self.results]),
             'avg_max_vibration': np.mean([r.metrics['max_vibration'] for r in self.results]),
         }
+
+
+# =============================================================================
+# Planning-Aware Scenario Generation
+# =============================================================================
+
+class PlanningAwareScenarioGenerator(BaseScenarioGenerator):
+    """
+    Generates scenarios based on planning and prediction information.
+
+    This generator creates realistic scenarios that incorporate:
+    - 调度计划 (Dispatch schedules)
+    - 维护计划 (Maintenance plans)
+    - 天气预测 (Weather forecasts)
+    - 上游来水预测 (Upstream inflow predictions)
+    - 季节性变化 (Seasonal variations)
+    """
+
+    def __init__(self, seed: Optional[int] = None):
+        super().__init__(seed)
+
+        # Import planning module
+        from src.control.planning_prediction import (
+            PlanningContextGenerator,
+            PlanningContext,
+            TimeOfDay,
+            Season,
+            WeekDay,
+            WeatherType,
+            PlanPriority,
+        )
+        self.ctx_generator = PlanningContextGenerator(seed)
+
+        # Scenario templates based on planning context
+        self.context_types = [
+            'normal_day',
+            'flood_scenario',
+            'drought_scenario',
+            'maintenance',
+            'transition',
+        ]
+
+        # Seasonal variations
+        self.seasons = list(Season)
+
+        # Time variations
+        self.times_of_day = list(TimeOfDay)
+
+    def generate(self) -> Generator[ScenarioSpec, None, None]:
+        """Generate planning-aware scenarios."""
+        from src.control.planning_prediction import (
+            PlanningContext, Season, TimeOfDay, WeekDay
+        )
+
+        # Generate scenarios for each context type
+        for ctx_type in self.context_types:
+            for season in self.seasons:
+                for time_of_day in self.times_of_day:
+                    for variation in range(3):  # 3 variations per combination
+                        ctx = self._generate_context(ctx_type, variation * 3600.0)
+                        ctx.season = season
+                        ctx.time_of_day = time_of_day
+
+                        spec = self._context_to_spec(ctx, ctx_type, variation)
+                        if spec:
+                            yield spec
+
+    def _generate_context(
+        self,
+        ctx_type: str,
+        base_time: float
+    ) -> 'PlanningContext':
+        """Generate planning context for given type."""
+        if ctx_type == 'normal_day':
+            return self.ctx_generator.generate_normal_day(base_time)
+        elif ctx_type == 'flood_scenario':
+            return self.ctx_generator.generate_flood_scenario(base_time)
+        elif ctx_type == 'drought_scenario':
+            return self.ctx_generator.generate_drought_scenario(base_time)
+        elif ctx_type == 'maintenance':
+            gate = self.rng.integers(0, 3)
+            return self.ctx_generator.generate_maintenance_scenario(base_time, gate)
+        else:
+            from_flow = self.rng.uniform(40, 80)
+            to_flow = self.rng.uniform(100, 160)
+            return self.ctx_generator.generate_transition_scenario(
+                base_time, from_flow, to_flow
+            )
+
+    def _context_to_spec(
+        self,
+        ctx: 'PlanningContext',
+        ctx_type: str,
+        variation: int
+    ) -> Optional[ScenarioSpec]:
+        """Convert planning context to scenario spec."""
+        from src.control.planning_prediction import Season, TimeOfDay
+
+        # Get expected flow from context
+        expected_flow = ctx.get_expected_inflow()
+        constraints = ctx.get_operational_constraints()
+        hints = ctx.get_scenario_hints()
+
+        # Build scenario name
+        name = f"Plan:{ctx_type}/{ctx.season.name}/{ctx.time_of_day.name}/v{variation+1}"
+
+        # Calculate difficulty based on context
+        difficulty = self._calculate_difficulty(ctx, ctx_type)
+
+        # Create events from planning context
+        events = self._extract_events(ctx)
+
+        # Get gate faults from maintenance
+        gate_faults = [GateFaultType.NONE] * 3
+        for m in ctx.get_active_maintenance():
+            for gate_idx in m.affected_gates:
+                if not m.is_gate_available(gate_idx):
+                    gate_faults[gate_idx] = GateFaultType.STUCK_CLOSED
+
+        return ScenarioSpec(
+            scenario_id=self._next_id("PLAN"),
+            name=name,
+            description=f"Planning scenario: {ctx_type} in {ctx.season.name}",
+            category="planning",
+            difficulty=difficulty,
+            target_flow=expected_flow,
+            head_upstream=10.0 if not ctx.drought_warning else 7.0,
+            head_downstream=8.0 if not ctx.drought_warning else 6.0,
+            flow_pattern=TransitionPattern.STEADY,
+            gate_faults=tuple(gate_faults),
+            duration=60.0,
+            events=events,
+            flow_params={
+                'context_type': ctx_type,
+                'season': ctx.season.name,
+                'time_of_day': ctx.time_of_day.name,
+                'constraints': constraints,
+                'hints': hints,
+            },
+        )
+
+    def _calculate_difficulty(
+        self,
+        ctx: 'PlanningContext',
+        ctx_type: str
+    ) -> float:
+        """Calculate scenario difficulty from context."""
+        difficulty = 0.2  # Base difficulty
+
+        # Context type difficulty
+        type_diff = {
+            'normal_day': 0.0,
+            'flood_scenario': 0.4,
+            'drought_scenario': 0.3,
+            'maintenance': 0.3,
+            'transition': 0.2,
+        }
+        difficulty += type_diff.get(ctx_type, 0.0)
+
+        # Warnings
+        if ctx.flood_warning:
+            difficulty += 0.2
+        if ctx.drought_warning:
+            difficulty += 0.15
+
+        # Active maintenance
+        maintenance = ctx.get_active_maintenance()
+        if maintenance:
+            difficulty += 0.1 * len(maintenance)
+
+        # Risk factors
+        hints = ctx.get_scenario_hints()
+        difficulty += 0.05 * len(hints.get('risk_factors', []))
+
+        return min(1.0, difficulty)
+
+    def _extract_events(
+        self,
+        ctx: 'PlanningContext'
+    ) -> List[Tuple[float, str, Dict[str, Any]]]:
+        """Extract events from planning context."""
+        events = []
+
+        # Extract dispatch plan events
+        dispatch = ctx.get_active_dispatch_plan()
+        if dispatch and dispatch.flow_schedule:
+            for t, flow in dispatch.flow_schedule[:5]:  # Limit events
+                rel_time = t - ctx.simulation_time
+                if 0 <= rel_time <= 60:
+                    events.append((rel_time, 'set_target_flow', {'value': flow}))
+
+        # Extract maintenance events
+        for m in ctx.maintenance_plans:
+            rel_start = m.start_time - ctx.simulation_time
+            if 0 <= rel_start <= 60:
+                for gate in m.affected_gates:
+                    events.append((
+                        rel_start,
+                        'inject_gate_fault',
+                        {'gate': gate, 'type': 'STUCK_CLOSED'}
+                    ))
+
+        return sorted(events, key=lambda e: e[0])
+
+    def count(self) -> int:
+        """Count total planning scenarios."""
+        return (len(self.context_types) *
+                len(self.seasons) *
+                len(self.times_of_day) *
+                3)  # 3 variations
+
+
+class SeasonalScenarioGenerator(BaseScenarioGenerator):
+    """
+    Generates scenarios with seasonal variations.
+
+    Considers:
+    - 丰水期 (Flood season: June-August)
+    - 枯水期 (Dry season: December-February)
+    - 过渡期 (Transition seasons)
+    """
+
+    def __init__(self, seed: Optional[int] = None):
+        super().__init__(seed)
+
+        self.seasonal_profiles = {
+            'flood_season': {
+                'months': [6, 7, 8],
+                'flow_range': (100, 200),
+                'head_range': (10.0, 14.0),
+                'flood_probability': 0.3,
+                'storm_probability': 0.2,
+            },
+            'dry_season': {
+                'months': [12, 1, 2],
+                'flow_range': (30, 80),
+                'head_range': (6.0, 9.0),
+                'drought_probability': 0.4,
+                'storm_probability': 0.05,
+            },
+            'spring_transition': {
+                'months': [3, 4, 5],
+                'flow_range': (60, 150),
+                'head_range': (8.0, 12.0),
+                'flood_probability': 0.1,
+                'storm_probability': 0.15,
+            },
+            'autumn_transition': {
+                'months': [9, 10, 11],
+                'flow_range': (50, 120),
+                'head_range': (7.0, 11.0),
+                'flood_probability': 0.05,
+                'storm_probability': 0.1,
+            },
+        }
+
+    def generate(self) -> Generator[ScenarioSpec, None, None]:
+        """Generate seasonal scenarios."""
+        for season_name, profile in self.seasonal_profiles.items():
+            # Generate scenarios for each month in season
+            for month in profile['months']:
+                for variation in range(5):  # 5 variations per month
+                    # Randomize within ranges
+                    flow = self.rng.uniform(*profile['flow_range'])
+                    head_up = self.rng.uniform(*profile['head_range'])
+                    head_down = head_up - self.rng.uniform(1.5, 3.0)
+
+                    # Determine if special condition
+                    is_flood = self.rng.random() < profile.get('flood_probability', 0)
+                    is_drought = self.rng.random() < profile.get('drought_probability', 0)
+                    is_storm = self.rng.random() < profile.get('storm_probability', 0)
+
+                    # Adjust for special conditions
+                    if is_flood:
+                        flow *= 1.5
+                        head_up += 2.0
+                    elif is_drought:
+                        flow *= 0.6
+                        head_up -= 1.5
+
+                    events = []
+                    if is_storm:
+                        # Storm event mid-scenario
+                        events.append((20.0, 'set_head_upstream', {'value': head_up + 1.5}))
+                        events.append((40.0, 'set_head_upstream', {'value': head_up}))
+
+                    difficulty = self._calculate_difficulty(
+                        season_name, is_flood, is_drought, is_storm
+                    )
+
+                    yield ScenarioSpec(
+                        scenario_id=self._next_id("SEASON"),
+                        name=f"Seasonal:{season_name}/M{month}/v{variation+1}",
+                        description=f"{season_name} scenario for month {month}",
+                        category="seasonal",
+                        difficulty=difficulty,
+                        target_flow=flow,
+                        head_upstream=head_up,
+                        head_downstream=max(4.0, head_down),
+                        flow_pattern=TransitionPattern.STEADY,
+                        duration=60.0,
+                        events=events,
+                        flow_params={
+                            'season': season_name,
+                            'month': month,
+                            'is_flood': is_flood,
+                            'is_drought': is_drought,
+                            'is_storm': is_storm,
+                        },
+                    )
+
+    def _calculate_difficulty(
+        self,
+        season: str,
+        is_flood: bool,
+        is_drought: bool,
+        is_storm: bool
+    ) -> float:
+        """Calculate scenario difficulty."""
+        difficulty = 0.2
+
+        if season == 'flood_season':
+            difficulty += 0.2
+        elif season == 'dry_season':
+            difficulty += 0.15
+
+        if is_flood:
+            difficulty += 0.3
+        if is_drought:
+            difficulty += 0.25
+        if is_storm:
+            difficulty += 0.15
+
+        return min(1.0, difficulty)
+
+    def count(self) -> int:
+        """Count total seasonal scenarios."""
+        total = 0
+        for profile in self.seasonal_profiles.values():
+            total += len(profile['months']) * 5
+        return total
+
+
+class PredictionScenarioGenerator(BaseScenarioGenerator):
+    """
+    Generates scenarios testing prediction accuracy.
+
+    Creates scenarios where predictions may be:
+    - Accurate
+    - Under-predicted
+    - Over-predicted
+    - Suddenly wrong (unexpected events)
+    """
+
+    def __init__(self, seed: Optional[int] = None):
+        super().__init__(seed)
+
+        self.prediction_accuracies = [
+            ('accurate', 0.0, 0.1),      # Prediction within 10%
+            ('under_5', -0.05, 0.02),    # 5% under-prediction
+            ('under_15', -0.15, 0.03),   # 15% under-prediction
+            ('under_30', -0.30, 0.05),   # 30% under-prediction
+            ('over_5', 0.05, 0.02),      # 5% over-prediction
+            ('over_15', 0.15, 0.03),     # 15% over-prediction
+            ('over_30', 0.30, 0.05),     # 30% over-prediction
+            ('sudden_change', 0.0, 0.5), # Sudden unexpected change
+        ]
+
+        self.base_flows = [50, 80, 100, 130, 160]
+
+    def generate(self) -> Generator[ScenarioSpec, None, None]:
+        """Generate prediction accuracy scenarios."""
+        for accuracy_name, bias, noise in self.prediction_accuracies:
+            for base_flow in self.base_flows:
+                for variation in range(3):
+                    # Predicted flow
+                    predicted_flow = base_flow
+
+                    # Actual flow (with prediction error)
+                    actual_flow = base_flow * (1.0 + bias + self.rng.normal(0, noise))
+
+                    events = []
+                    if accuracy_name == 'sudden_change':
+                        # Sudden change mid-scenario
+                        change_time = 20.0 + self.rng.uniform(0, 20)
+                        new_flow = base_flow * (1.0 + self.rng.choice([-0.4, 0.5]))
+                        events.append((change_time, 'set_target_flow', {'value': new_flow}))
+                        actual_flow = new_flow
+
+                    difficulty = self._calculate_difficulty(accuracy_name, abs(bias))
+
+                    yield ScenarioSpec(
+                        scenario_id=self._next_id("PRED"),
+                        name=f"Prediction:{accuracy_name}/Q{base_flow}/v{variation+1}",
+                        description=f"Testing prediction with {accuracy_name} error",
+                        category="prediction",
+                        difficulty=difficulty,
+                        target_flow=actual_flow,
+                        head_upstream=10.0,
+                        head_downstream=8.0,
+                        flow_pattern=TransitionPattern.STEADY,
+                        duration=60.0,
+                        events=events,
+                        flow_params={
+                            'predicted_flow': predicted_flow,
+                            'actual_flow': actual_flow,
+                            'accuracy_type': accuracy_name,
+                            'bias': bias,
+                            'noise': noise,
+                        },
+                    )
+
+    def _calculate_difficulty(self, accuracy_type: str, bias: float) -> float:
+        """Calculate difficulty based on prediction error."""
+        if accuracy_type == 'accurate':
+            return 0.2
+        elif accuracy_type == 'sudden_change':
+            return 0.8
+        else:
+            return 0.3 + abs(bias) * 1.5
+
+    def count(self) -> int:
+        """Count prediction scenarios."""
+        return len(self.prediction_accuracies) * len(self.base_flows) * 3
+
+
+class DispatchScheduleGenerator(BaseScenarioGenerator):
+    """
+    Generates scenarios based on typical dispatch schedules.
+
+    Includes:
+    - Daily operation patterns
+    - Weekly patterns
+    - Holiday patterns
+    - Emergency dispatch
+    """
+
+    def __init__(self, seed: Optional[int] = None):
+        super().__init__(seed)
+
+        # Daily patterns
+        self.daily_patterns = [
+            'weekday_normal',
+            'weekend_reduced',
+            'holiday_minimal',
+            'peak_demand',
+            'night_operation',
+        ]
+
+    def generate(self) -> Generator[ScenarioSpec, None, None]:
+        """Generate dispatch schedule scenarios."""
+        for pattern in self.daily_patterns:
+            for variation in range(4):
+                events = self._generate_schedule_events(pattern, variation)
+                initial_flow = self._get_initial_flow(pattern)
+                difficulty = self._calculate_difficulty(pattern)
+
+                yield ScenarioSpec(
+                    scenario_id=self._next_id("DISP"),
+                    name=f"Dispatch:{pattern}/v{variation+1}",
+                    description=f"Dispatch schedule: {pattern}",
+                    category="dispatch",
+                    difficulty=difficulty,
+                    target_flow=initial_flow,
+                    head_upstream=10.0,
+                    head_downstream=8.0,
+                    flow_pattern=TransitionPattern.STEADY,
+                    duration=120.0,  # Longer to show pattern
+                    events=events,
+                    flow_params={'pattern': pattern, 'variation': variation},
+                )
+
+    def _generate_schedule_events(
+        self,
+        pattern: str,
+        variation: int
+    ) -> List[Tuple[float, str, Dict[str, Any]]]:
+        """Generate events for schedule pattern."""
+        events = []
+        base_variation = 1.0 + variation * 0.1
+
+        if pattern == 'weekday_normal':
+            # Morning ramp, steady, evening ramp down
+            events = [
+                (0, 'set_target_flow', {'value': 80 * base_variation}),
+                (20, 'set_target_flow', {'value': 120 * base_variation}),  # Morning peak
+                (60, 'set_target_flow', {'value': 100 * base_variation}),  # Midday
+                (90, 'set_target_flow', {'value': 110 * base_variation}),  # Afternoon
+                (110, 'set_target_flow', {'value': 70 * base_variation}),  # Evening decline
+            ]
+        elif pattern == 'weekend_reduced':
+            events = [
+                (0, 'set_target_flow', {'value': 60 * base_variation}),
+                (30, 'set_target_flow', {'value': 70 * base_variation}),
+                (90, 'set_target_flow', {'value': 60 * base_variation}),
+            ]
+        elif pattern == 'holiday_minimal':
+            events = [
+                (0, 'set_target_flow', {'value': 40 * base_variation}),
+                (60, 'set_target_flow', {'value': 50 * base_variation}),
+            ]
+        elif pattern == 'peak_demand':
+            events = [
+                (0, 'set_target_flow', {'value': 100 * base_variation}),
+                (15, 'set_target_flow', {'value': 150 * base_variation}),
+                (45, 'set_target_flow', {'value': 170 * base_variation}),
+                (75, 'set_target_flow', {'value': 140 * base_variation}),
+                (100, 'set_target_flow', {'value': 100 * base_variation}),
+            ]
+        elif pattern == 'night_operation':
+            events = [
+                (0, 'set_target_flow', {'value': 50 * base_variation}),
+                (40, 'set_target_flow', {'value': 40 * base_variation}),
+                (80, 'set_target_flow', {'value': 60 * base_variation}),
+            ]
+
+        return events
+
+    def _get_initial_flow(self, pattern: str) -> float:
+        """Get initial flow for pattern."""
+        return {
+            'weekday_normal': 80,
+            'weekend_reduced': 60,
+            'holiday_minimal': 40,
+            'peak_demand': 100,
+            'night_operation': 50,
+        }.get(pattern, 80)
+
+    def _calculate_difficulty(self, pattern: str) -> float:
+        """Calculate difficulty for pattern."""
+        return {
+            'weekday_normal': 0.3,
+            'weekend_reduced': 0.2,
+            'holiday_minimal': 0.15,
+            'peak_demand': 0.5,
+            'night_operation': 0.25,
+        }.get(pattern, 0.3)
+
+    def count(self) -> int:
+        return len(self.daily_patterns) * 4
+
+
+# =============================================================================
+# Extended Full Scenario Generator
+# =============================================================================
+
+class ExtendedScenarioGenerator(FullScenarioGenerator):
+    """
+    Extended scenario generator including planning-aware scenarios.
+
+    Adds planning, seasonal, prediction, and dispatch scenarios
+    to the base generator.
+    """
+
+    def __init__(self, seed: Optional[int] = None):
+        super().__init__(seed)
+
+        # Add new generators
+        self.generators['planning'] = PlanningAwareScenarioGenerator(seed)
+        self.generators['seasonal'] = SeasonalScenarioGenerator(seed)
+        self.generators['prediction'] = PredictionScenarioGenerator(seed)
+        self.generators['dispatch'] = DispatchScheduleGenerator(seed)
