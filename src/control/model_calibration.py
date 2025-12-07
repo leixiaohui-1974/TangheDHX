@@ -187,11 +187,11 @@ class RecursiveLeastSquaresEstimator:
         phi = phi.reshape(-1, 1)  # Column vector
 
         # Prediction
-        y_pred = float(phi.T @ self._theta)
+        y_pred = (phi.T @ self._theta).item()
         error = y - y_pred
 
         # Kalman gain
-        denominator = self.lambda_ + float(phi.T @ self._P @ phi)
+        denominator = self.lambda_ + (phi.T @ self._P @ phi).item()
         K = self._P @ phi / denominator
 
         # Update parameter estimate
