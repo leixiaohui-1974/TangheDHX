@@ -4,6 +4,13 @@ Tanghe Inverted Siphon Web Application.
 
 This module provides the Flask web application for monitoring and
 controlling the digital twin simulation with full scenario-aware control.
+
+Features:
+- Real-time simulation monitoring
+- Hierarchical agent system control
+- Time-series data storage and analysis
+- Anomaly detection and alerting
+- History replay functionality
 """
 
 import logging
@@ -22,6 +29,11 @@ from src.control.local import LocalController
 from src.control.manager import ScenarioManager
 from src.control.integrated_controller import IntegratedController, ScenarioType
 from src.control.scenario_advanced import AdvancedScenarioManager
+from src.agents.communication import AgentNetwork
+from src.data.storage import TimeSeriesStorage, DataPoint
+from src.data.analysis import DataAnalyzer
+from src.data.anomaly import AnomalyDetector, ThresholdRule, RateRule, Severity
+from src.data.replay import HistoryReplay, ReplayMode
 
 # Configure logging
 logging.basicConfig(
@@ -77,7 +89,87 @@ class SimulationState:
         # Diagnostics storage
         self._last_diagnostics: Dict[str, Any] = {}
 
-        logger.info("SimulationState initialized")
+        # Agent network for hierarchical control
+        self.agent_network = AgentNetwork(self.model)
+        self.agent_network.create_standard_network()
+
+        # Data storage for time-series
+        self.data_storage = TimeSeriesStorage()
+        self._init_data_series()
+
+        # Data analyzer
+        self.data_analyzer = DataAnalyzer(self.data_storage)
+
+        # Anomaly detector
+        self.anomaly_detector = AnomalyDetector(self.data_storage)
+        self._init_anomaly_rules()
+
+        # History replay
+        self.replay = HistoryReplay(self.data_storage)
+
+        logger.info("SimulationState initialized with full feature set")
+
+    def _init_data_series(self) -> None:
+        """Initialize data series for storage."""
+        # Flow and hydraulic series
+        self.data_storage.create_series('total_flow', 'm³/s')
+        self.data_storage.create_series('head_upstream', 'm')
+        self.data_storage.create_series('head_downstream', 'm')
+        self.data_storage.create_series('head_diff', 'm')
+
+        # Gate series
+        for i in range(3):
+            self.data_storage.create_series(f'gate_{i}_opening', '%')
+            self.data_storage.create_series(f'gate_{i}_flow', 'm³/s')
+            self.data_storage.create_series(f'gate_{i}_velocity', 'm/s')
+            self.data_storage.create_series(f'gate_{i}_vibration', 'mm/s')
+
+        # Control series
+        self.data_storage.create_series('target_flow', 'm³/s')
+        self.data_storage.create_series('flow_error', 'm³/s')
+
+    def _init_anomaly_rules(self) -> None:
+        """Initialize anomaly detection rules."""
+        # Flow anomalies
+        self.anomaly_detector.add_rule(ThresholdRule(
+            rule_id='flow_high',
+            series_name='total_flow',
+            min_value=0,
+            max_value=450,
+            severity=Severity.WARNING,
+            message='Total flow exceeds normal range'
+        ))
+
+        # Head difference anomalies
+        self.anomaly_detector.add_rule(ThresholdRule(
+            rule_id='head_diff_extreme',
+            series_name='head_diff',
+            min_value=-5,
+            max_value=10,
+            severity=Severity.WARNING,
+            message='Head difference abnormal'
+        ))
+
+        # Vibration anomalies for each gate
+        for i in range(3):
+            self.anomaly_detector.add_rule(ThresholdRule(
+                rule_id=f'vib_gate_{i}',
+                series_name=f'gate_{i}_vibration',
+                min_value=0,
+                max_value=50,
+                severity=Severity.CRITICAL,
+                message=f'Gate {i} vibration exceeds safety limit'
+            ))
+
+            # Rate of change rule
+            self.anomaly_detector.add_rule(RateRule(
+                rule_id=f'vib_rate_gate_{i}',
+                series_name=f'gate_{i}_vibration',
+                max_rate=20,
+                window=5.0,
+                severity=Severity.WARNING,
+                message=f'Gate {i} vibration changing rapidly'
+            ))
 
     @property
     def running(self) -> bool:
@@ -187,6 +279,47 @@ class SimulationState:
 
                 self.model.step(self.actuator.get_target_openings(), dt)
 
+            # Record data to storage
+            self._record_data()
+
+            # Check for anomalies
+            self._check_anomalies()
+
+    def _record_data(self) -> None:
+        """Record current state to data storage."""
+        ts = time.time()
+        state = self.model.get_state()
+
+        # Record flow and hydraulic data
+        self.data_storage.write('total_flow', ts, state['total_flow'])
+        self.data_storage.write('head_upstream', ts, state['head_upstream'])
+        self.data_storage.write('head_downstream', ts, state['head_downstream'])
+        self.data_storage.write('head_diff', ts,
+                                state['head_upstream'] - state['head_downstream'])
+
+        # Record gate data
+        for i in range(3):
+            self.data_storage.write(f'gate_{i}_opening', ts,
+                                    state['gate_openings'][i] * 100)
+            self.data_storage.write(f'gate_{i}_flow', ts,
+                                    state['gate_flows'][i])
+            self.data_storage.write(f'gate_{i}_velocity', ts,
+                                    state['velocities'][i])
+            self.data_storage.write(f'gate_{i}_vibration', ts,
+                                    state['vibrations'][i])
+
+        # Record control data
+        self.data_storage.write('target_flow', ts, self._target_flow)
+        self.data_storage.write('flow_error', ts,
+                                abs(state['total_flow'] - self._target_flow))
+
+    def _check_anomalies(self) -> None:
+        """Check for anomalies in current data."""
+        anomalies = self.anomaly_detector.check_all()
+        if anomalies:
+            for anomaly in anomalies:
+                logger.warning(f"Anomaly detected: {anomaly.message}")
+
     def reset(self) -> None:
         """Reset simulation to initial state (thread-safe)."""
         with self._lock:
@@ -198,6 +331,13 @@ class SimulationState:
                 self.local_ctrl.reset()
                 self.scenario_mgr.reset()
             self._last_diagnostics = {}
+
+            # Reset agent network
+            self.agent_network.reset()
+
+            # Clear anomaly history
+            self.anomaly_detector.clear_history()
+
             logger.info("Simulation reset to initial state")
 
 
@@ -434,6 +574,550 @@ def create_app() -> Flask:
             })
         except Exception as e:
             logger.error("Error getting performance: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Agent Network API Endpoints
+    # =========================================================================
+
+    @app.route('/api/agents')
+    def get_agents():
+        """Get all agents status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            return jsonify({
+                'network': sim_state.agent_network.get_network_status(),
+                'agents': sim_state.agent_network.get_all_agent_status(),
+            })
+        except Exception as e:
+            logger.error("Error getting agents: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/agents/hierarchy')
+    def get_agent_hierarchy():
+        """Get agent hierarchy tree."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            return jsonify({
+                'hierarchy': sim_state.agent_network.get_hierarchy_tree(),
+            })
+        except Exception as e:
+            logger.error("Error getting agent hierarchy: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/agents/control', methods=['POST'])
+    def control_agents():
+        """Control agent network."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            action = data.get('action', '')
+
+            if action == 'start':
+                sim_state.agent_network.start()
+            elif action == 'stop':
+                sim_state.agent_network.stop()
+            elif action == 'reset':
+                sim_state.agent_network.reset()
+            elif action == 'set_target':
+                target = float(data.get('target_flow', 150))
+                sim_state.agent_network.set_global_target_flow(target)
+            elif action == 'emergency':
+                reason = data.get('reason', 'Manual emergency')
+                sim_state.agent_network.broadcast_emergency(reason)
+            else:
+                return jsonify({'error': f'Unknown action: {action}'}), 400
+
+            return jsonify({
+                'status': 'ok',
+                'action': action,
+                'network': sim_state.agent_network.get_network_status(),
+            })
+        except Exception as e:
+            logger.error("Error controlling agents: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/agents/<agent_id>')
+    def get_agent_detail(agent_id: str):
+        """Get specific agent details."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            agent = sim_state.agent_network.get_agent(agent_id)
+            if agent is None:
+                return jsonify({'error': f'Agent {agent_id} not found'}), 404
+
+            return jsonify({
+                'status': agent.get_status(),
+                'diagnostics': agent.get_diagnostics(),
+            })
+        except Exception as e:
+            logger.error("Error getting agent detail: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Data Storage API Endpoints
+    # =========================================================================
+
+    @app.route('/api/data/series')
+    def get_data_series():
+        """Get list of available data series."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            series_list = sim_state.data_storage.list_series()
+            series_info = {}
+            for name in series_list:
+                info = sim_state.data_storage.get_series_info(name)
+                if info:
+                    series_info[name] = info
+
+            return jsonify({
+                'series': series_list,
+                'info': series_info,
+            })
+        except Exception as e:
+            logger.error("Error getting data series: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/data/query')
+    def query_data():
+        """Query time-series data."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            series_name = request.args.get('series', '')
+            start_time = request.args.get('start', type=float)
+            end_time = request.args.get('end', type=float)
+            limit = request.args.get('limit', 1000, type=int)
+
+            if not series_name:
+                return jsonify({'error': 'Series name required'}), 400
+
+            # Default to last hour if no time range specified
+            if end_time is None:
+                end_time = time.time()
+            if start_time is None:
+                start_time = end_time - 3600
+
+            points = sim_state.data_storage.read(
+                series_name, start_time, end_time, limit
+            )
+
+            return jsonify({
+                'series': series_name,
+                'start': start_time,
+                'end': end_time,
+                'count': len(points),
+                'data': [
+                    {'timestamp': p.timestamp, 'value': p.value, 'quality': p.quality}
+                    for p in points
+                ],
+            })
+        except Exception as e:
+            logger.error("Error querying data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/data/latest')
+    def get_latest_data():
+        """Get latest data point for each series."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            series_names = request.args.getlist('series')
+            if not series_names:
+                series_names = sim_state.data_storage.list_series()
+
+            latest = {}
+            for name in series_names:
+                point = sim_state.data_storage.read_latest(name)
+                if point:
+                    latest[name] = {
+                        'timestamp': point.timestamp,
+                        'value': point.value,
+                        'quality': point.quality,
+                    }
+
+            return jsonify({'latest': latest})
+        except Exception as e:
+            logger.error("Error getting latest data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/data/analysis')
+    def analyze_data():
+        """Analyze data series."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            series_name = request.args.get('series', '')
+            analysis_type = request.args.get('type', 'stats')
+            window = request.args.get('window', 300, type=float)
+
+            if not series_name:
+                return jsonify({'error': 'Series name required'}), 400
+
+            end_time = time.time()
+            start_time = end_time - window
+
+            result = {}
+            if analysis_type == 'stats':
+                result = sim_state.data_analyzer.basic_stats(
+                    series_name, start_time, end_time
+                )
+            elif analysis_type == 'trend':
+                result = sim_state.data_analyzer.analyze_trend(
+                    series_name, start_time, end_time
+                )
+            elif analysis_type == 'outliers':
+                outliers = sim_state.data_analyzer.outlier_detection(
+                    series_name, start_time, end_time
+                )
+                result = {
+                    'count': len(outliers),
+                    'outliers': [
+                        {'timestamp': p.timestamp, 'value': p.value}
+                        for p in outliers[:100]  # Limit output
+                    ]
+                }
+            else:
+                return jsonify({'error': f'Unknown analysis type: {analysis_type}'}), 400
+
+            return jsonify({
+                'series': series_name,
+                'type': analysis_type,
+                'window': window,
+                'result': result,
+            })
+        except Exception as e:
+            logger.error("Error analyzing data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/data/export', methods=['POST'])
+    def export_data():
+        """Export data to JSON."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json or {}
+            series_names = data.get('series', None)
+            start_time = data.get('start', None)
+            end_time = data.get('end', None)
+
+            export_data = sim_state.data_storage.export_json(
+                series_names, start_time, end_time
+            )
+
+            return jsonify(export_data)
+        except Exception as e:
+            logger.error("Error exporting data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Anomaly Detection API Endpoints
+    # =========================================================================
+
+    @app.route('/api/anomalies')
+    def get_anomalies():
+        """Get detected anomalies."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            limit = request.args.get('limit', 100, type=int)
+            severity = request.args.get('severity', None)
+
+            anomalies = sim_state.anomaly_detector.get_history(limit)
+
+            if severity:
+                try:
+                    sev = Severity[severity.upper()]
+                    anomalies = [a for a in anomalies if a.severity == sev]
+                except KeyError:
+                    pass
+
+            return jsonify({
+                'count': len(anomalies),
+                'anomalies': [
+                    {
+                        'anomaly_id': a.anomaly_id,
+                        'timestamp': a.timestamp,
+                        'type': a.anomaly_type.name,
+                        'severity': a.severity.name,
+                        'series': a.series_name,
+                        'value': a.value,
+                        'message': a.message,
+                        'acknowledged': a.acknowledged,
+                    }
+                    for a in anomalies
+                ],
+            })
+        except Exception as e:
+            logger.error("Error getting anomalies: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/anomalies/rules')
+    def get_anomaly_rules():
+        """Get configured anomaly rules."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            rules = sim_state.anomaly_detector.get_rules()
+            return jsonify({
+                'count': len(rules),
+                'rules': [
+                    {
+                        'rule_id': r.rule_id,
+                        'series': r.series_name,
+                        'type': type(r).__name__,
+                        'severity': r.severity.name,
+                        'enabled': r.enabled,
+                    }
+                    for r in rules
+                ],
+            })
+        except Exception as e:
+            logger.error("Error getting anomaly rules: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/anomalies/acknowledge', methods=['POST'])
+    def acknowledge_anomaly():
+        """Acknowledge an anomaly."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            anomaly_id = data.get('anomaly_id', '')
+            if not anomaly_id:
+                return jsonify({'error': 'Anomaly ID required'}), 400
+
+            success = sim_state.anomaly_detector.acknowledge(anomaly_id)
+            if success:
+                return jsonify({'status': 'ok', 'anomaly_id': anomaly_id})
+            return jsonify({'error': 'Anomaly not found'}), 404
+        except Exception as e:
+            logger.error("Error acknowledging anomaly: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/anomalies/stats')
+    def get_anomaly_stats():
+        """Get anomaly statistics."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            stats = sim_state.anomaly_detector.get_statistics()
+            return jsonify(stats)
+        except Exception as e:
+            logger.error("Error getting anomaly stats: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # History Replay API Endpoints
+    # =========================================================================
+
+    @app.route('/api/replay/create', methods=['POST'])
+    def create_replay():
+        """Create a replay session."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json or {}
+            start_time = data.get('start', time.time() - 3600)
+            end_time = data.get('end', time.time())
+            series = data.get('series', None)
+            speed = data.get('speed', 1.0)
+            mode = data.get('mode', 'REALTIME')
+
+            try:
+                replay_mode = ReplayMode[mode.upper()]
+            except KeyError:
+                replay_mode = ReplayMode.REALTIME
+
+            session = sim_state.replay.create_session(
+                start_time=start_time,
+                end_time=end_time,
+                series_names=series,
+                mode=replay_mode,
+                speed=speed,
+            )
+
+            return jsonify({
+                'status': 'ok',
+                'session_id': session.session_id,
+                'start_time': session.start_time,
+                'end_time': session.end_time,
+            })
+        except Exception as e:
+            logger.error("Error creating replay: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/replay/control', methods=['POST'])
+    def control_replay():
+        """Control replay playback."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            action = data.get('action', '')
+
+            if action == 'play':
+                sim_state.replay.play()
+            elif action == 'pause':
+                sim_state.replay.pause()
+            elif action == 'stop':
+                sim_state.replay.stop()
+            elif action == 'seek':
+                timestamp = float(data.get('timestamp', 0))
+                sim_state.replay.seek(timestamp)
+            elif action == 'speed':
+                speed = float(data.get('speed', 1.0))
+                sim_state.replay.set_speed(speed)
+            else:
+                return jsonify({'error': f'Unknown action: {action}'}), 400
+
+            return jsonify({
+                'status': 'ok',
+                'action': action,
+                'summary': sim_state.replay.get_summary(),
+            })
+        except Exception as e:
+            logger.error("Error controlling replay: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/replay/status')
+    def get_replay_status():
+        """Get replay session status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            return jsonify(sim_state.replay.get_summary())
+        except Exception as e:
+            logger.error("Error getting replay status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/replay/step', methods=['POST'])
+    def step_replay():
+        """Execute one replay step."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json or {}
+            dt = data.get('dt', 0.1)
+
+            result = sim_state.replay.step(dt)
+
+            # Convert data points to serializable format
+            if 'data' in result:
+                serialized_data = {}
+                for series_name, points in result['data'].items():
+                    serialized_data[series_name] = [
+                        {'timestamp': p.timestamp, 'value': p.value}
+                        for p in points
+                    ]
+                result['data'] = serialized_data
+
+            # Convert events
+            if 'events' in result:
+                result['events'] = [
+                    {
+                        'timestamp': e.timestamp,
+                        'type': e.event_type,
+                        'data': e.data,
+                    }
+                    for e in result['events']
+                ]
+
+            return jsonify(result)
+        except Exception as e:
+            logger.error("Error stepping replay: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/replay/data')
+    def get_replay_data():
+        """Get data at specific replay time."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            timestamp = request.args.get('timestamp', type=float)
+            series = request.args.getlist('series')
+
+            if timestamp is None:
+                session = sim_state.replay.get_session()
+                if session:
+                    timestamp = session.current_time
+                else:
+                    timestamp = time.time()
+
+            data = sim_state.replay.get_data_at_time(
+                timestamp,
+                series if series else None
+            )
+
+            return jsonify({
+                'timestamp': timestamp,
+                'data': data,
+            })
+        except Exception as e:
+            logger.error("Error getting replay data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # System Info API Endpoint
+    # =========================================================================
+
+    @app.route('/api/system')
+    def get_system_info():
+        """Get comprehensive system information."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            return jsonify({
+                'simulation': {
+                    'running': sim_state.running,
+                    'target_flow': sim_state.target_flow,
+                },
+                'agents': {
+                    'count': len(sim_state.agent_network._agents),
+                    'running': sim_state.agent_network._running,
+                },
+                'data': {
+                    'series_count': len(sim_state.data_storage.list_series()),
+                    'storage_info': sim_state.data_storage.get_storage_stats(),
+                },
+                'anomalies': sim_state.anomaly_detector.get_statistics(),
+                'replay': sim_state.replay.get_summary(),
+            })
+        except Exception as e:
+            logger.error("Error getting system info: %s", e)
             return jsonify({'error': str(e)}), 500
 
     return app
