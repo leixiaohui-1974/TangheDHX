@@ -98,10 +98,10 @@ class SimulationState:
         self._init_data_series()
 
         # Data analyzer
-        self.data_analyzer = DataAnalyzer(self.data_storage)
+        self.data_analyzer = DataAnalyzer()
 
         # Anomaly detector
-        self.anomaly_detector = AnomalyDetector(self.data_storage)
+        self.anomaly_detector = AnomalyDetector()
         self._init_anomaly_rules()
 
         # History replay
@@ -131,44 +131,37 @@ class SimulationState:
     def _init_anomaly_rules(self) -> None:
         """Initialize anomaly detection rules."""
         # Flow anomalies
-        self.anomaly_detector.add_rule(ThresholdRule(
-            rule_id='flow_high',
+        self.anomaly_detector.add_threshold_rule(ThresholdRule(
+            name='flow_high',
             series_name='total_flow',
-            min_value=0,
-            max_value=450,
-            severity=Severity.WARNING,
-            message='Total flow exceeds normal range'
+            low=0,
+            high=450,
         ))
 
         # Head difference anomalies
-        self.anomaly_detector.add_rule(ThresholdRule(
-            rule_id='head_diff_extreme',
+        self.anomaly_detector.add_threshold_rule(ThresholdRule(
+            name='head_diff_extreme',
             series_name='head_diff',
-            min_value=-5,
-            max_value=10,
-            severity=Severity.WARNING,
-            message='Head difference abnormal'
+            low=-5,
+            high=10,
         ))
 
         # Vibration anomalies for each gate
         for i in range(3):
-            self.anomaly_detector.add_rule(ThresholdRule(
-                rule_id=f'vib_gate_{i}',
+            self.anomaly_detector.add_threshold_rule(ThresholdRule(
+                name=f'vib_gate_{i}',
                 series_name=f'gate_{i}_vibration',
-                min_value=0,
-                max_value=50,
-                severity=Severity.CRITICAL,
-                message=f'Gate {i} vibration exceeds safety limit'
+                low=0,
+                high=50,
+                high_high=80,
             ))
 
             # Rate of change rule
-            self.anomaly_detector.add_rule(RateRule(
-                rule_id=f'vib_rate_gate_{i}',
+            self.anomaly_detector.add_rate_rule(RateRule(
+                name=f'vib_rate_gate_{i}',
                 series_name=f'gate_{i}_vibration',
                 max_rate=20,
                 window=5.0,
-                severity=Severity.WARNING,
-                message=f'Gate {i} vibration changing rapidly'
             ))
 
     @property
