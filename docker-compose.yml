@@ -1,0 +1,110 @@
+# Docker Compose for Tanghe Inverted Siphon Digital Twin System
+# 唐河倒虹吸数字孪生系统 Docker Compose 配置
+
+version: '3.8'
+
+services:
+  # Main digital twin application
+  tanghe-siphon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tanghe-siphon-app
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/state"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - tanghe-network
+
+  # Development mode with hot reload
+  tanghe-siphon-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tanghe-siphon-dev
+    ports:
+      - "5001:5000"
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - PYTHONPATH=/app
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python -m flask run --host=0.0.0.0 --port=5000 --reload
+    profiles:
+      - dev
+    networks:
+      - tanghe-network
+
+  # Redis for optional caching (future enhancement)
+  redis:
+    image: redis:7-alpine
+    container_name: tanghe-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    profiles:
+      - full
+    networks:
+      - tanghe-network
+
+  # Prometheus for metrics collection (future enhancement)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tanghe-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    profiles:
+      - monitoring
+    networks:
+      - tanghe-network
+
+  # Grafana for visualization (future enhancement)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tanghe-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+    profiles:
+      - monitoring
+    depends_on:
+      - prometheus
+    networks:
+      - tanghe-network
+
+networks:
+  tanghe-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:

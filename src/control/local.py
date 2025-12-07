@@ -1,53 +1,108 @@
+# -*- coding: utf-8 -*-
+"""
+Local Controller (PLC level).
+
+This module implements the fast-loop control logic including
+pass-through commands and dithering for vibration mitigation.
+"""
+
+import logging
+from typing import List, Optional
+
 import numpy as np
+
+from src.config import get_config, ControlConfig
+
+logger = logging.getLogger(__name__)
+
 
 class LocalController:
     """
     Local Controller (PLC level).
-    Handles fast-loop logic: pass-through and dithering.
+
+    Handles fast-loop logic including pass-through and dithering
+    to mitigate vibration when detected.
+
+    Attributes:
+        model: Reference to the physics model
+        dithering_active: List of dithering states for each gate
+        dithering_phase: List of dithering phase angles for each gate
     """
 
-    def __init__(self, model):
-        self.model = model
-        # Resonance frequency range to avoid (in terms of Opening/Velocity?)
-        # Ideally, we monitor vibration.
-        self.dithering_active = [False, False, False]
-        self.dithering_phase = [0.0, 0.0, 0.0]
-
-    def update(self, mpc_targets, dt):
+    def __init__(
+        self,
+        model: 'TangheSiphonModel',
+        config: Optional[ControlConfig] = None
+    ) -> None:
         """
-        Adjusts MPC targets based on local conditions.
-        Returns final actuator commands.
+        Initialize the local controller.
+
+        Args:
+            model: Reference to the physics model
+            config: Control configuration. If None, uses global config.
+        """
+        self.model = model
+        self._config = config or get_config().control
+
+        num_gates = model.num_gates
+        self.dithering_active: List[bool] = [False] * num_gates
+        self.dithering_phase: List[float] = [0.0] * num_gates
+
+        logger.debug(
+            "LocalController initialized: dither_amp=%.3f m, dither_freq=%.2f Hz",
+            self._config.dithering_amplitude,
+            self._config.dithering_frequency
+        )
+
+    def update(self, mpc_targets: np.ndarray, dt: float) -> np.ndarray:
+        """
+        Adjust MPC targets based on local conditions.
+
+        This method applies dithering when vibration exceeds thresholds
+        to help break resonance patterns.
+
+        Args:
+            mpc_targets: Target openings from MPC [m]
+            dt: Time step [s]
+
+        Returns:
+            Final actuator commands [m]
         """
         final_cmds = np.copy(mpc_targets)
+        cfg = self._config
 
-        # 1. Pass-through Logic (Active Jumping)
-        # If we are commanding a change that crosses the resonance zone, do it FAST.
-        # But `physics.py` limits speed. The PLC basically just sets the target.
-        # The 'Logic' is more about NOT STOPPING in the zone.
-        # Since MPC already avoids the zone in steady state, the transition is the issue.
-        # Here we just pass the target.
-        # But if MPC fails and asks for a value inside the zone (due to constraints),
-        # Local controller could override?
-        # For now, we trust MPC's "Blacklist".
-
-        # 2. Dithering (Micro-perturbation)
-        # If vibration is high, add sine wave to opening.
-
-        for i in range(3):
+        for i in range(len(mpc_targets)):
             accel = self.model.vibration_accel[i]
 
-            # Threshold for Dithering trigger
-            if accel > 0.15: # 0.15g is quite high
-                self.dithering_active[i] = True
-            elif accel < 0.05:
-                self.dithering_active[i] = False
+            # Update dithering state based on vibration level
+            if accel > cfg.dithering_threshold_high:
+                if not self.dithering_active[i]:
+                    self.dithering_active[i] = True
+                    logger.info(
+                        "Gate %d: Dithering activated (vib=%.3f g > %.3f g)",
+                        i, accel, cfg.dithering_threshold_high
+                    )
+            elif accel < cfg.dithering_threshold_low:
+                if self.dithering_active[i]:
+                    self.dithering_active[i] = False
+                    self.dithering_phase[i] = 0.0
+                    logger.info(
+                        "Gate %d: Dithering deactivated (vib=%.3f g < %.3f g)",
+                        i, accel, cfg.dithering_threshold_low
+                    )
 
+            # Apply dithering perturbation if active
             if self.dithering_active[i]:
-                # Add +/- 2cm sine wave at 0.5 Hz
-                amp = 0.02
-                omega = 2 * np.pi * 0.5
+                omega = 2 * np.pi * cfg.dithering_frequency
                 self.dithering_phase[i] += omega * dt
-                perturbation = amp * np.sin(self.dithering_phase[i])
+                perturbation = cfg.dithering_amplitude * np.sin(self.dithering_phase[i])
                 final_cmds[i] += perturbation
 
         return final_cmds
+
+    def reset(self) -> None:
+        """Reset controller state."""
+        num_gates = self.model.num_gates
+        self.dithering_active = [False] * num_gates
+        self.dithering_phase = [0.0] * num_gates
+        logger.debug("LocalController reset")
