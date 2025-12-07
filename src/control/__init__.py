@@ -16,6 +16,12 @@ from .scenario_advanced import (
     ScenarioDetector,
     AdvancedScenarioManager,
 )
+from .integrated_controller import (
+    IntegratedController,
+    MPCObjective,
+    MPCConstraints,
+    ScenarioControlConfig,
+)
 
 __all__ = [
     'SpectralMPC',
@@ -31,4 +37,8 @@ __all__ = [
     'ScenarioConfig',
     'ScenarioDetector',
     'AdvancedScenarioManager',
+    'IntegratedController',
+    'MPCObjective',
+    'MPCConstraints',
+    'ScenarioControlConfig',
 ]
