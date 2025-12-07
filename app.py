@@ -24,16 +24,23 @@ from src.config import get_config
 from src.simulation.physics import TangheSiphonModel
 from src.simulation.sensors import ADCPSensor, VibrationSensor
 from src.simulation.actuators import GateController
+from src.simulation.sensors_extended import SensorNetwork
+from src.simulation.actuators_extended import ActuatorNetwork as ExtActuatorNetwork
 from src.control.mpc import SpectralMPC
 from src.control.local import LocalController
 from src.control.manager import ScenarioManager
 from src.control.integrated_controller import IntegratedController, ScenarioType
 from src.control.scenario_advanced import AdvancedScenarioManager
+from src.control.model_calibration import IDZModelCalibrator
+from src.control.state_evaluation import RealTimeStateEvaluator
+from src.control.state_prediction import RealTimeStatePredictor
 from src.agents.communication import AgentNetwork
 from src.data.storage import TimeSeriesStorage, DataPoint
 from src.data.analysis import DataAnalyzer
 from src.data.anomaly import AnomalyDetector, ThresholdRule, RateRule, Severity
 from src.data.replay import HistoryReplay, ReplayMode
+from src.data.governance import DataGovernanceEngine
+from src.data.assimilation import DataAssimilationEngine
 
 # Configure logging
 logging.basicConfig(
@@ -107,7 +114,32 @@ class SimulationState:
         # History replay
         self.replay = HistoryReplay(self.data_storage)
 
-        logger.info("SimulationState initialized with full feature set")
+        # =====================================================================
+        # New Extended Features
+        # =====================================================================
+
+        # Extended sensor network
+        self.sensor_network = SensorNetwork(self.model)
+
+        # Extended actuator network
+        self.ext_actuator_network = ExtActuatorNetwork(self.model)
+
+        # Data governance engine
+        self.data_governance = DataGovernanceEngine()
+
+        # Data assimilation engine
+        self.data_assimilation = DataAssimilationEngine(state_dim=12)
+
+        # Model calibration (IDZ parameter update)
+        self.model_calibrator = IDZModelCalibrator()
+
+        # Real-time state evaluation
+        self.state_evaluator = RealTimeStateEvaluator()
+
+        # Real-time state prediction
+        self.state_predictor = RealTimeStatePredictor(self.model)
+
+        logger.info("SimulationState initialized with full feature set including extended modules")
 
     def _init_data_series(self) -> None:
         """Initialize data series for storage."""
@@ -1111,6 +1143,466 @@ def create_app() -> Flask:
             })
         except Exception as e:
             logger.error("Error getting system info: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Extended Sensor Network API Endpoints
+    # =========================================================================
+
+    @app.route('/api/sensors/extended')
+    def get_extended_sensors():
+        """Get readings from extended sensor network."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            readings = sim_state.sensor_network.sample_all()
+            # Convert SensorReading objects to dicts
+            serialized = {'timestamp': readings['timestamp']}
+
+            for key, value in readings.items():
+                if key == 'timestamp':
+                    continue
+                if hasattr(value, 'value'):
+                    serialized[key] = {
+                        'value': value.value,
+                        'quality': value.quality,
+                        'status': value.status.value if hasattr(value.status, 'value') else str(value.status),
+                        'unit': value.unit
+                    }
+                elif isinstance(value, list):
+                    serialized[key] = [
+                        {'value': r.value, 'quality': r.quality, 'unit': r.unit}
+                        for r in value if hasattr(r, 'value')
+                    ]
+                elif isinstance(value, dict):
+                    serialized[key] = {
+                        k: {'value': v.value, 'quality': v.quality, 'unit': v.unit}
+                        for k, v in value.items() if hasattr(v, 'value')
+                    }
+                else:
+                    serialized[key] = value
+
+            return jsonify(serialized)
+        except Exception as e:
+            logger.error("Error getting extended sensors: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensors/health')
+    def get_sensor_health():
+        """Get sensor health status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            health = sim_state.sensor_network.get_health_status()
+            # Convert health objects to dicts
+            serialized = {}
+            for key, value in health.items():
+                if hasattr(value, 'status'):
+                    serialized[key] = {
+                        'status': value.status.value,
+                        'signal_quality': value.signal_quality,
+                        'fault_count': value.fault_count
+                    }
+                elif isinstance(value, list):
+                    serialized[key] = [
+                        {'status': h.status.value, 'fault_count': h.fault_count}
+                        for h in value if hasattr(h, 'status')
+                    ]
+            return jsonify({'health': serialized})
+        except Exception as e:
+            logger.error("Error getting sensor health: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Extended Actuator Network API Endpoints
+    # =========================================================================
+
+    @app.route('/api/actuators/extended')
+    def get_extended_actuators():
+        """Get extended actuator status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            health = sim_state.ext_actuator_network.get_all_health()
+            serialized = {
+                'emergency_stop_active': health['emergency_stop_active'],
+                'gates': []
+            }
+            for h in health['gates']:
+                serialized['gates'].append({
+                    'status': h.status.value,
+                    'fault_type': h.fault_type.value,
+                    'operating_hours': h.operating_hours,
+                    'cycle_count': h.cycle_count,
+                    'temperature': h.temperature,
+                    'power_consumption': h.power_consumption,
+                    'wear_level': h.wear_level
+                })
+            return jsonify(serialized)
+        except Exception as e:
+            logger.error("Error getting extended actuators: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/actuators/command', methods=['POST'])
+    def command_extended_actuators():
+        """Command extended actuators."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            import numpy as np
+
+            if 'targets' in data:
+                targets = np.array(data['targets'])
+                sim_state.ext_actuator_network.command_gates(targets)
+
+            if 'emergency_stop' in data and data['emergency_stop']:
+                sim_state.ext_actuator_network.emergency_stop()
+
+            if 'reset_emergency' in data and data['reset_emergency']:
+                sim_state.ext_actuator_network.reset_emergency_stop()
+
+            return jsonify({'status': 'ok'})
+        except Exception as e:
+            logger.error("Error commanding actuators: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Data Governance API Endpoints
+    # =========================================================================
+
+    @app.route('/api/governance/process', methods=['POST'])
+    def process_data_governance():
+        """Process data through governance pipeline."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            processed, quality, status = sim_state.data_governance.process(
+                data,
+                source=data.get('source', 'api'),
+                timestamp=time.time()
+            )
+
+            return jsonify({
+                'processed_data': processed,
+                'quality_score': {
+                    'overall': quality.overall,
+                    'completeness': quality.completeness,
+                    'accuracy': quality.accuracy,
+                    'consistency': quality.consistency,
+                    'issues': quality.issues
+                },
+                'status': status.value
+            })
+        except Exception as e:
+            logger.error("Error in data governance: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/governance/report')
+    def get_governance_report():
+        """Get data governance report."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            report = sim_state.data_governance.get_governance_report()
+            return jsonify(report)
+        except Exception as e:
+            logger.error("Error getting governance report: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Data Assimilation API Endpoints
+    # =========================================================================
+
+    @app.route('/api/assimilation/run', methods=['POST'])
+    def run_assimilation():
+        """Run data assimilation with observations."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            observations = data.get('observations', {})
+            error_std = data.get('error_std', 0.1)
+
+            result = sim_state.data_assimilation.assimilate(
+                sim_state.model,
+                observations,
+                error_std=error_std
+            )
+
+            return jsonify({
+                'status': 'ok',
+                'method': result['method'],
+                'timestamp': result['timestamp']
+            })
+        except Exception as e:
+            logger.error("Error in data assimilation: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/assimilation/uncertainty')
+    def get_assimilation_uncertainty():
+        """Get current state uncertainty from assimilation."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            uncertainty = sim_state.data_assimilation.get_state_uncertainty()
+            return jsonify({
+                'uncertainty': uncertainty.tolist()
+            })
+        except Exception as e:
+            logger.error("Error getting uncertainty: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Model Calibration API Endpoints
+    # =========================================================================
+
+    @app.route('/api/calibration/update', methods=['POST'])
+    def update_calibration():
+        """Update model calibration with high-fidelity data."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            hifi_state = data.get('hifi_state', sim_state.model.get_state())
+            idz_state = data.get('idz_state', sim_state.model.get_state())
+
+            result = sim_state.model_calibrator.update_from_high_fidelity(
+                hifi_state, idz_state, timestamp=sim_state.model.time
+            )
+
+            return jsonify({
+                'parameters': result.parameters,
+                'residual': result.residual,
+                'status': result.convergence_status.value,
+                'iterations': result.iterations
+            })
+        except Exception as e:
+            logger.error("Error updating calibration: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/calibration/status')
+    def get_calibration_status():
+        """Get current calibration status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            summary = sim_state.model_calibrator.get_calibration_summary()
+            return jsonify(summary)
+        except Exception as e:
+            logger.error("Error getting calibration status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/calibration/apply', methods=['POST'])
+    def apply_calibration():
+        """Apply calibrated parameters to model."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            sim_state.model_calibrator.apply_to_model(sim_state.model)
+            return jsonify({'status': 'ok', 'message': 'Parameters applied'})
+        except Exception as e:
+            logger.error("Error applying calibration: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # State Evaluation API Endpoints
+    # =========================================================================
+
+    @app.route('/api/evaluation')
+    def get_state_evaluation():
+        """Get real-time state evaluation."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            target_flow = request.args.get('target_flow', type=float)
+            evaluation = sim_state.state_evaluator.evaluate(
+                sim_state.model,
+                target_flow=target_flow or sim_state.target_flow
+            )
+
+            return jsonify({
+                'performance': {
+                    'overall': evaluation.performance.overall,
+                    'level': evaluation.performance.level.value,
+                    'by_objective': evaluation.performance.by_objective
+                },
+                'deviations': [
+                    {
+                        'objective': d.objective.name,
+                        'current_value': d.current_value,
+                        'target_value': d.objective.target_value,
+                        'deviation': d.deviation,
+                        'within_tolerance': d.within_tolerance
+                    }
+                    for d in evaluation.deviations
+                ],
+                'alarms': evaluation.alarms,
+                'recommendations': evaluation.recommendations,
+                'timestamp': evaluation.timestamp
+            })
+        except Exception as e:
+            logger.error("Error in state evaluation: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/evaluation/objectives')
+    def get_control_objectives():
+        """Get control objectives configuration."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            return jsonify(sim_state.state_evaluator.get_objective_summary())
+        except Exception as e:
+            logger.error("Error getting objectives: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/evaluation/objectives', methods=['POST'])
+    def update_control_objective():
+        """Update a control objective."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            name = data.get('name')
+            target = data.get('target')
+
+            if name and target is not None:
+                sim_state.state_evaluator.objective_manager.update_target(name, target)
+
+            return jsonify({'status': 'ok'})
+        except Exception as e:
+            logger.error("Error updating objective: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # State Prediction API Endpoints
+    # =========================================================================
+
+    @app.route('/api/prediction')
+    def get_state_prediction():
+        """Get state prediction."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            horizon = request.args.get('horizon', 60.0, type=float)
+            result = sim_state.state_predictor.predict(horizon_seconds=horizon)
+
+            physics = result['physics_prediction']
+            return jsonify({
+                'method': physics.method.value,
+                'horizon': physics.horizon.value,
+                'predictions': {
+                    'times': physics.prediction_times.tolist(),
+                    'total_flow': physics.predicted_state['total_flow'].tolist(),
+                },
+                'uncertainty': physics.uncertainty,
+                'trend_analyses': {
+                    k: {
+                        'current_value': v.current_value,
+                        'trend_direction': v.trend_direction,
+                        'predicted_value': v.predicted_value,
+                        'confidence': v.confidence
+                    }
+                    for k, v in result['trend_analyses'].items()
+                },
+                'active_alerts': [
+                    {
+                        'type': a.alert_type,
+                        'severity': a.severity,
+                        'variable': a.variable,
+                        'message': a.message,
+                        'time_to_event': a.time_to_event
+                    }
+                    for a in result['active_alerts']
+                ]
+            })
+        except Exception as e:
+            logger.error("Error in state prediction: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/prediction/whatif', methods=['POST'])
+    def what_if_analysis():
+        """Perform what-if analysis."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            import numpy as np
+
+            data = request.json
+            if data is None:
+                return jsonify({'error': 'No JSON data provided'}), 400
+
+            targets = np.array(data.get('target_openings', [1.0, 1.0, 1.0]))
+            horizon = data.get('horizon', 60.0)
+
+            analysis = sim_state.state_predictor.what_if_analysis(
+                target_openings=targets,
+                horizon_seconds=horizon
+            )
+
+            return jsonify(analysis)
+        except Exception as e:
+            logger.error("Error in what-if analysis: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/prediction/alerts')
+    def get_predictive_alerts():
+        """Get active predictive alerts."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            alerts = sim_state.state_predictor.alert_engine.get_active_alerts()
+            return jsonify({
+                'count': len(alerts),
+                'alerts': [
+                    {
+                        'type': a.alert_type,
+                        'severity': a.severity,
+                        'variable': a.variable,
+                        'current_value': a.current_value,
+                        'predicted_value': a.predicted_value,
+                        'threshold': a.threshold,
+                        'time_to_event': a.time_to_event,
+                        'message': a.message
+                    }
+                    for a in alerts
+                ]
+            })
+        except Exception as e:
+            logger.error("Error getting alerts: %s", e)
             return jsonify({'error': str(e)}), 500
 
     return app
