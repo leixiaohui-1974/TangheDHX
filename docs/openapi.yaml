@@ -1,0 +1,1188 @@
+openapi: 3.0.3
+info:
+  title: Tanghe Inverted Siphon Digital Twin API
+  description: |
+    唐河倒虹吸数字孪生系统 API 文档
+
+    ## 功能概述
+    - **实时仿真监控**: 获取系统状态、诊断信息
+    - **控制操作**: 设置目标流量、切换场景、故障注入
+    - **智能体网络**: 层级化智能体控制和状态查询
+    - **数据存储**: 时序数据查询、分析和导出
+    - **异常检测**: 实时异常监控和告警
+    - **历史回放**: 数据回放和事件重现
+
+    ## 认证
+    当前版本不需要认证，适用于内部部署环境。
+
+    ## 错误处理
+    所有 API 返回统一的错误格式：
+    ```json
+    {
+      "error": "错误类型",
+      "message": "详细错误信息"
+    }
+    ```
+  version: 1.0.0
+  contact:
+    name: Digital Twin Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:5000
+    description: 本地开发服务器
+  - url: http://192.168.1.100:5000
+    description: 内网部署服务器
+
+tags:
+  - name: Simulation
+    description: 仿真控制和状态查询
+  - name: Control
+    description: 控制系统操作
+  - name: Agents
+    description: 智能体网络管理
+  - name: Data
+    description: 时序数据存储和分析
+  - name: Anomaly
+    description: 异常检测和告警
+  - name: Replay
+    description: 历史数据回放
+  - name: System
+    description: 系统信息和配置
+
+paths:
+  /:
+    get:
+      summary: 主页面
+      description: 返回系统监控主界面
+      tags:
+        - System
+      responses:
+        '200':
+          description: HTML 页面
+
+  /api/state:
+    get:
+      summary: 获取当前仿真状态
+      description: 返回系统的完整状态信息，包括流量、水头、闸门开度等
+      tags:
+        - Simulation
+      responses:
+        '200':
+          description: 当前系统状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimulationState'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/diagnostics:
+    get:
+      summary: 获取控制诊断信息
+      description: 返回控制器的详细诊断信息，包括 MPC 配置、约束状态等
+      tags:
+        - Control
+      responses:
+        '200':
+          description: 诊断信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Diagnostics'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/history:
+    get:
+      summary: 获取控制历史
+      description: 返回最近 N 条控制历史记录
+      tags:
+        - Control
+      parameters:
+        - name: n
+          in: query
+          description: 返回的历史记录数量
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        '200':
+          description: 控制历史
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ControlHistoryItem'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/control:
+    post:
+      summary: 设置控制参数
+      description: 修改目标流量、切换场景或暂停/启动仿真
+      tags:
+        - Control
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_flow:
+                  type: number
+                  description: 目标流量 (m³/s)
+                  minimum: 0
+                  maximum: 500
+                  example: 150.0
+                scenario:
+                  type: string
+                  description: 场景标识
+                  example: "NORMAL_MEDIUM_FLOW"
+                running:
+                  type: boolean
+                  description: 仿真运行状态
+                  example: true
+      responses:
+        '200':
+          description: 设置成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  state:
+                    $ref: '#/components/schemas/SimulationState'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/reset:
+    post:
+      summary: 重置仿真
+      description: 将仿真重置到初始状态
+      tags:
+        - Simulation
+      responses:
+        '200':
+          description: 重置成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  message:
+                    type: string
+                    example: "Simulation reset"
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/scenarios:
+    get:
+      summary: 获取可用场景列表
+      description: 返回所有可用的控制场景及其配置
+      tags:
+        - Control
+      responses:
+        '200':
+          description: 场景列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scenarios:
+                    type: object
+                    additionalProperties:
+                      $ref: '#/components/schemas/ScenarioConfig'
+                  current:
+                    type: string
+                    description: 当前激活的场景
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/config:
+    get:
+      summary: 获取系统配置
+      description: 返回当前系统配置（只读）
+      tags:
+        - System
+      responses:
+        '200':
+          description: 系统配置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemConfig'
+
+  /api/mpc_config:
+    get:
+      summary: 获取 MPC 配置
+      description: 返回当前 MPC 控制器的配置参数
+      tags:
+        - Control
+      responses:
+        '200':
+          description: MPC 配置
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mpc:
+                    type: object
+                  constraints:
+                    type: object
+                  adaptation:
+                    type: object
+        '404':
+          description: MPC 配置不可用
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/inject_fault:
+    post:
+      summary: 注入故障
+      description: 向指定闸门注入故障，用于测试
+      tags:
+        - Simulation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                gate:
+                  type: integer
+                  description: 闸门索引 (0-2)
+                  minimum: 0
+                  maximum: 2
+                  example: 0
+                type:
+                  type: string
+                  description: 故障类型
+                  enum: [stuck, drift, noise]
+                  example: "stuck"
+      responses:
+        '200':
+          description: 故障注入成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  message:
+                    type: string
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/performance:
+    get:
+      summary: 获取性能指标
+      description: 返回系统性能统计信息
+      tags:
+        - Simulation
+      responses:
+        '200':
+          description: 性能指标
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PerformanceMetrics'
+        '404':
+          description: 无历史数据
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  # Agent Network Endpoints
+  /api/agents:
+    get:
+      summary: 获取所有智能体状态
+      description: 返回智能体网络状态和所有智能体的详细信息
+      tags:
+        - Agents
+      responses:
+        '200':
+          description: 智能体状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  network:
+                    $ref: '#/components/schemas/NetworkStatus'
+                  agents:
+                    type: object
+                    additionalProperties:
+                      $ref: '#/components/schemas/AgentStatus'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/agents/hierarchy:
+    get:
+      summary: 获取智能体层级结构
+      description: 返回智能体的树状层级结构
+      tags:
+        - Agents
+      responses:
+        '200':
+          description: 层级结构
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hierarchy:
+                    type: object
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/agents/control:
+    post:
+      summary: 控制智能体网络
+      description: 启动、停止或重置智能体网络
+      tags:
+        - Agents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - action
+              properties:
+                action:
+                  type: string
+                  enum: [start, stop, reset, set_target, emergency]
+                  description: 控制动作
+                target_flow:
+                  type: number
+                  description: 目标流量（set_target 动作需要）
+                reason:
+                  type: string
+                  description: 紧急原因（emergency 动作需要）
+      responses:
+        '200':
+          description: 操作成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  action:
+                    type: string
+                  network:
+                    $ref: '#/components/schemas/NetworkStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/agents/{agent_id}:
+    get:
+      summary: 获取特定智能体详情
+      description: 返回指定智能体的详细状态和诊断信息
+      tags:
+        - Agents
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: 智能体 ID
+      responses:
+        '200':
+          description: 智能体详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    $ref: '#/components/schemas/AgentStatus'
+                  diagnostics:
+                    type: object
+        '404':
+          description: 智能体未找到
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  # Data Storage Endpoints
+  /api/data/series:
+    get:
+      summary: 获取数据序列列表
+      description: 返回所有可用的数据序列
+      tags:
+        - Data
+      responses:
+        '200':
+          description: 序列列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  series:
+                    type: array
+                    items:
+                      type: string
+                  info:
+                    type: object
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/data/query:
+    get:
+      summary: 查询时序数据
+      description: 查询指定序列在时间范围内的数据
+      tags:
+        - Data
+      parameters:
+        - name: series
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 序列名称
+        - name: start
+          in: query
+          schema:
+            type: number
+          description: 开始时间戳（Unix timestamp）
+        - name: end
+          in: query
+          schema:
+            type: number
+          description: 结束时间戳（Unix timestamp）
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 1000
+          description: 最大返回点数
+      responses:
+        '200':
+          description: 查询结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  series:
+                    type: string
+                  start:
+                    type: number
+                  end:
+                    type: number
+                  count:
+                    type: integer
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DataPoint'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/data/latest:
+    get:
+      summary: 获取最新数据
+      description: 获取每个序列的最新数据点
+      tags:
+        - Data
+      parameters:
+        - name: series
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          description: 序列名称列表（不指定则返回全部）
+      responses:
+        '200':
+          description: 最新数据
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  latest:
+                    type: object
+                    additionalProperties:
+                      $ref: '#/components/schemas/DataPoint'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/data/analysis:
+    get:
+      summary: 分析数据序列
+      description: 对数据序列进行统计分析
+      tags:
+        - Data
+      parameters:
+        - name: series
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 序列名称
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [stats, trend, outliers]
+            default: stats
+          description: 分析类型
+        - name: window
+          in: query
+          schema:
+            type: number
+            default: 300
+          description: 分析窗口（秒）
+      responses:
+        '200':
+          description: 分析结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  series:
+                    type: string
+                  type:
+                    type: string
+                  window:
+                    type: number
+                  result:
+                    type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/data/export:
+    post:
+      summary: 导出数据
+      description: 将数据导出为 JSON 格式
+      tags:
+        - Data
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                series:
+                  type: array
+                  items:
+                    type: string
+                  description: 要导出的序列（不指定则全部）
+                start:
+                  type: number
+                  description: 开始时间戳
+                end:
+                  type: number
+                  description: 结束时间戳
+      responses:
+        '200':
+          description: 导出数据
+          content:
+            application/json:
+              schema:
+                type: object
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  # Anomaly Detection Endpoints
+  /api/anomalies:
+    get:
+      summary: 获取异常列表
+      description: 返回检测到的异常事件
+      tags:
+        - Anomaly
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+          description: 最大返回数量
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum: [INFO, WARNING, CRITICAL]
+          description: 过滤严重程度
+      responses:
+        '200':
+          description: 异常列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  anomalies:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Anomaly'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/anomalies/rules:
+    get:
+      summary: 获取异常规则
+      description: 返回配置的异常检测规则
+      tags:
+        - Anomaly
+      responses:
+        '200':
+          description: 规则列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  rules:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AnomalyRule'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/anomalies/acknowledge:
+    post:
+      summary: 确认异常
+      description: 确认一个异常事件
+      tags:
+        - Anomaly
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - anomaly_id
+              properties:
+                anomaly_id:
+                  type: string
+                  description: 异常 ID
+      responses:
+        '200':
+          description: 确认成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  anomaly_id:
+                    type: string
+        '404':
+          description: 异常未找到
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/anomalies/stats:
+    get:
+      summary: 获取异常统计
+      description: 返回异常检测的统计信息
+      tags:
+        - Anomaly
+      responses:
+        '200':
+          description: 统计信息
+          content:
+            application/json:
+              schema:
+                type: object
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  # Replay Endpoints
+  /api/replay/create:
+    post:
+      summary: 创建回放会话
+      description: 创建新的历史数据回放会话
+      tags:
+        - Replay
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                start:
+                  type: number
+                  description: 开始时间戳
+                end:
+                  type: number
+                  description: 结束时间戳
+                series:
+                  type: array
+                  items:
+                    type: string
+                  description: 要回放的序列
+                speed:
+                  type: number
+                  default: 1.0
+                  description: 回放速度
+                mode:
+                  type: string
+                  enum: [REALTIME, STEP, FAST_FORWARD]
+                  default: REALTIME
+      responses:
+        '200':
+          description: 会话创建成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  session_id:
+                    type: string
+                  start_time:
+                    type: number
+                  end_time:
+                    type: number
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/replay/control:
+    post:
+      summary: 控制回放
+      description: 控制回放的播放、暂停、停止等
+      tags:
+        - Replay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - action
+              properties:
+                action:
+                  type: string
+                  enum: [play, pause, stop, seek, speed]
+                timestamp:
+                  type: number
+                  description: 跳转时间戳（seek 动作需要）
+                speed:
+                  type: number
+                  description: 播放速度（speed 动作需要）
+      responses:
+        '200':
+          description: 控制成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  action:
+                    type: string
+                  summary:
+                    type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/replay/status:
+    get:
+      summary: 获取回放状态
+      description: 返回当前回放会话的状态
+      tags:
+        - Replay
+      responses:
+        '200':
+          description: 回放状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplaySummary'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/replay/step:
+    post:
+      summary: 单步回放
+      description: 执行一步回放
+      tags:
+        - Replay
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dt:
+                  type: number
+                  default: 0.1
+                  description: 步进时间（秒）
+      responses:
+        '200':
+          description: 步进结果
+          content:
+            application/json:
+              schema:
+                type: object
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/replay/data:
+    get:
+      summary: 获取回放时刻数据
+      description: 获取指定时刻的数据
+      tags:
+        - Replay
+      parameters:
+        - name: timestamp
+          in: query
+          schema:
+            type: number
+          description: 时间戳
+        - name: series
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          description: 序列列表
+      responses:
+        '200':
+          description: 时刻数据
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timestamp:
+                    type: number
+                  data:
+                    type: object
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/system:
+    get:
+      summary: 获取系统信息
+      description: 返回系统的综合信息
+      tags:
+        - System
+      responses:
+        '200':
+          description: 系统信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemInfo'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+components:
+  schemas:
+    SimulationState:
+      type: object
+      properties:
+        total_flow:
+          type: number
+          description: 总流量 (m³/s)
+        head_upstream:
+          type: number
+          description: 上游水头 (m)
+        head_downstream:
+          type: number
+          description: 下游水头 (m)
+        gate_openings:
+          type: array
+          items:
+            type: number
+          description: 闸门开度 (0-1)
+        gate_flows:
+          type: array
+          items:
+            type: number
+          description: 各闸门流量 (m³/s)
+        velocities:
+          type: array
+          items:
+            type: number
+          description: 各通道流速 (m/s)
+        vibrations:
+          type: array
+          items:
+            type: number
+          description: 各闸门振动 (mm/s)
+        target_flow:
+          type: number
+          description: 目标流量 (m³/s)
+        simulation_running:
+          type: boolean
+        active_scenario:
+          type: string
+
+    Diagnostics:
+      type: object
+      properties:
+        scenario:
+          type: object
+        control:
+          type: object
+        performance:
+          type: object
+
+    ControlHistoryItem:
+      type: object
+      properties:
+        timestamp:
+          type: number
+        scenario:
+          type: string
+        performance:
+          type: object
+          properties:
+            flow_tracking_error:
+              type: number
+            max_vibration:
+              type: number
+            in_resonance_band:
+              type: boolean
+
+    ScenarioConfig:
+      type: object
+      properties:
+        description:
+          type: string
+        target_modifier:
+          type: number
+        use_pid:
+          type: boolean
+
+    SystemConfig:
+      type: object
+      properties:
+        physics:
+          type: object
+          properties:
+            num_gates:
+              type: integer
+            gate_width:
+              type: number
+            structural_frequency:
+              type: number
+        control:
+          type: object
+          properties:
+            alpha:
+              type: number
+            beta:
+              type: number
+            gamma:
+              type: number
+        simulation:
+          type: object
+          properties:
+            dt:
+              type: number
+            default_target_flow:
+              type: number
+
+    PerformanceMetrics:
+      type: object
+      properties:
+        flow_tracking:
+          type: object
+          properties:
+            mean_error:
+              type: number
+            max_error:
+              type: number
+            min_error:
+              type: number
+        vibration:
+          type: object
+          properties:
+            mean_max:
+              type: number
+            peak:
+              type: number
+        resonance:
+          type: object
+          properties:
+            time_in_band_pct:
+              type: number
+        sample_count:
+          type: integer
+
+    NetworkStatus:
+      type: object
+      properties:
+        running:
+          type: boolean
+        agent_count:
+          type: integer
+        message_count:
+          type: integer
+
+    AgentStatus:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        state:
+          type: string
+        parent:
+          type: string
+
+    DataPoint:
+      type: object
+      properties:
+        timestamp:
+          type: number
+        value:
+          type: number
+        quality:
+          type: integer
+
+    Anomaly:
+      type: object
+      properties:
+        anomaly_id:
+          type: string
+        timestamp:
+          type: number
+        type:
+          type: string
+        severity:
+          type: string
+          enum: [INFO, WARNING, CRITICAL]
+        series:
+          type: string
+        value:
+          type: number
+        message:
+          type: string
+        acknowledged:
+          type: boolean
+
+    AnomalyRule:
+      type: object
+      properties:
+        rule_id:
+          type: string
+        series:
+          type: string
+        type:
+          type: string
+        severity:
+          type: string
+        enabled:
+          type: boolean
+
+    ReplaySummary:
+      type: object
+      properties:
+        session_id:
+          type: string
+        state:
+          type: string
+        start_time:
+          type: number
+        end_time:
+          type: number
+        current_time:
+          type: number
+        progress:
+          type: number
+        speed:
+          type: number
+
+    SystemInfo:
+      type: object
+      properties:
+        simulation:
+          type: object
+          properties:
+            running:
+              type: boolean
+            target_flow:
+              type: number
+        agents:
+          type: object
+          properties:
+            count:
+              type: integer
+            running:
+              type: boolean
+        data:
+          type: object
+          properties:
+            series_count:
+              type: integer
+            storage_info:
+              type: object
+        anomalies:
+          type: object
+        replay:
+          type: object
+
+  responses:
+    BadRequest:
+      description: 请求参数错误
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: "Bad request"
+              message:
+                type: string
+
+    ServerError:
+      description: 服务器内部错误
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: "Internal server error"
