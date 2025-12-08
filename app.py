@@ -60,6 +60,14 @@ from src.streaming.realtime import (
     EventType,
     EventPriority
 )
+from src.scenarios.generator import (
+    ScenarioLibrary,
+    ScenarioGenerator,
+    ScenarioExecutor,
+    AutomatedTestRunner,
+    ScenarioCategory,
+    ScenarioSeverity
+)
 from datetime import datetime
 
 # Configure logging
@@ -174,6 +182,15 @@ class SimulationState:
         self.data_hub = RealTimeDataHub(aggregation_interval_ms=1000)
         self.data_hub.start()
         self._init_data_streams()
+
+        # Scenario auto-generation system
+        self.scenario_library = ScenarioLibrary()
+        self.scenario_generator = ScenarioGenerator(self.scenario_library)
+        self.scenario_executor = ScenarioExecutor(self.model)
+        self.test_runner = AutomatedTestRunner(
+            self.scenario_generator, self.scenario_executor
+        )
+        self._current_scenario_result: Optional[Dict] = None
 
         logger.info("SimulationState initialized with full feature set including extended modules")
 
@@ -2315,6 +2332,389 @@ def create_app() -> Flask:
             return jsonify({'status': 'ok', 'message': 'Data published'})
         except Exception as e:
             logger.error("Error publishing streaming data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Scenario Auto-Generation API Endpoints
+    # =========================================================================
+
+    @app.route('/api/scenario_gen/library')
+    def get_scenario_library():
+        """Get all available scenario templates."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            templates = sim_state.scenario_library.list_templates()
+            result = []
+            for template in templates:
+                result.append({
+                    'template_id': template.template_id,
+                    'name': template.name,
+                    'description': template.description,
+                    'category': template.category.name,
+                    'severity': template.severity.name,
+                    'duration_range': [template.duration_range[0], template.duration_range[1]],
+                    'parameter_count': len(template.parameters),
+                    'event_count': len(template.timeline.events) if template.timeline else 0
+                })
+            return jsonify({
+                'count': len(result),
+                'templates': result
+            })
+        except Exception as e:
+            logger.error("Error getting scenario library: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/library/<template_id>')
+    def get_scenario_template(template_id: str):
+        """Get detailed information about a specific template."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            template = sim_state.scenario_library.get_template(template_id)
+            if template is None:
+                return jsonify({'error': f'Template {template_id} not found'}), 404
+
+            return jsonify({
+                'template_id': template.template_id,
+                'name': template.name,
+                'description': template.description,
+                'category': template.category.name,
+                'severity': template.severity.name,
+                'duration_range': [template.duration_range[0], template.duration_range[1]],
+                'parameters': {
+                    name: {
+                        'min': p.min_value,
+                        'max': p.max_value,
+                        'default': p.default,
+                        'distribution': p.distribution.name
+                    }
+                    for name, p in template.parameters.items()
+                },
+                'events': [
+                    {
+                        'name': e.name,
+                        'time_offset': e.time_offset,
+                        'action': e.action
+                    }
+                    for e in (template.timeline.events if template.timeline else [])
+                ]
+            })
+        except Exception as e:
+            logger.error("Error getting scenario template: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/library/category/<category>')
+    def get_templates_by_category(category: str):
+        """Get templates filtered by category."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            try:
+                cat = ScenarioCategory[category.upper()]
+            except KeyError:
+                return jsonify({'error': f'Invalid category: {category}'}), 400
+
+            templates = sim_state.scenario_library.get_by_category(cat)
+            result = [
+                {
+                    'template_id': t.template_id,
+                    'name': t.name,
+                    'description': t.description,
+                    'severity': t.severity.name
+                }
+                for t in templates
+            ]
+            return jsonify({
+                'category': category.upper(),
+                'count': len(result),
+                'templates': result
+            })
+        except Exception as e:
+            logger.error("Error getting templates by category: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/generate', methods=['POST'])
+    def generate_scenario():
+        """Generate a scenario from a template."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            template_id = data.get('template_id')
+            parameter_overrides = data.get('parameters', {})
+            seed = data.get('seed')
+
+            if not template_id:
+                return jsonify({'error': 'template_id is required'}), 400
+
+            scenario = sim_state.scenario_generator.generate_from_template(
+                template_id,
+                parameter_overrides=parameter_overrides,
+                seed=seed
+            )
+
+            return jsonify({
+                'status': 'ok',
+                'scenario': {
+                    'scenario_id': scenario.scenario_id,
+                    'template_id': scenario.template_id,
+                    'name': scenario.name,
+                    'duration': scenario.duration,
+                    'parameters': scenario.parameters,
+                    'event_count': len(scenario.events)
+                }
+            })
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            logger.error("Error generating scenario: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/generate/monte_carlo', methods=['POST'])
+    def generate_monte_carlo():
+        """Generate multiple scenarios using Monte Carlo sampling."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            template_id = data.get('template_id')
+            num_samples = data.get('num_samples', 10)
+            seed = data.get('seed')
+
+            if not template_id:
+                return jsonify({'error': 'template_id is required'}), 400
+
+            scenarios = sim_state.scenario_generator.generate_monte_carlo(
+                template_id,
+                num_samples=num_samples,
+                seed=seed
+            )
+
+            return jsonify({
+                'status': 'ok',
+                'count': len(scenarios),
+                'scenarios': [
+                    {
+                        'scenario_id': s.scenario_id,
+                        'name': s.name,
+                        'duration': s.duration,
+                        'parameters': s.parameters
+                    }
+                    for s in scenarios
+                ]
+            })
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            logger.error("Error generating Monte Carlo scenarios: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/execute', methods=['POST'])
+    def execute_scenario():
+        """Execute a generated scenario."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            template_id = data.get('template_id')
+            parameters = data.get('parameters', {})
+            dt = data.get('dt', 0.1)
+
+            if not template_id:
+                return jsonify({'error': 'template_id is required'}), 400
+
+            # Generate scenario
+            scenario = sim_state.scenario_generator.generate_from_template(
+                template_id,
+                parameter_overrides=parameters
+            )
+
+            # Execute scenario
+            result = sim_state.scenario_executor.execute(scenario, dt=dt)
+
+            # Store result for later retrieval
+            sim_state._current_scenario_result = {
+                'scenario_id': result.scenario_id,
+                'success': result.success,
+                'duration': result.actual_duration,
+                'metrics': result.metrics,
+                'events_triggered': result.events_triggered,
+                'errors': result.errors
+            }
+
+            return jsonify({
+                'status': 'ok',
+                'result': sim_state._current_scenario_result
+            })
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            logger.error("Error executing scenario: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/batch', methods=['POST'])
+    def run_batch_scenarios():
+        """Run a batch of scenarios for automated testing."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            template_ids = data.get('template_ids')
+            category = data.get('category')
+            num_variations = data.get('num_variations', 1)
+            parallel = data.get('parallel', False)
+
+            if template_ids:
+                # Run specific templates
+                results = sim_state.test_runner.run_templates(
+                    template_ids,
+                    num_variations=num_variations,
+                    parallel=parallel
+                )
+            elif category:
+                # Run all templates in category
+                try:
+                    cat = ScenarioCategory[category.upper()]
+                except KeyError:
+                    return jsonify({'error': f'Invalid category: {category}'}), 400
+
+                results = sim_state.test_runner.run_category(
+                    cat,
+                    num_variations=num_variations,
+                    parallel=parallel
+                )
+            else:
+                # Run all templates
+                results = sim_state.test_runner.run_all(
+                    num_variations=num_variations,
+                    parallel=parallel
+                )
+
+            return jsonify({
+                'status': 'ok',
+                'batch_results': {
+                    'total': len(results),
+                    'passed': sum(1 for r in results if r.success),
+                    'failed': sum(1 for r in results if not r.success),
+                    'results': [
+                        {
+                            'scenario_id': r.scenario_id,
+                            'success': r.success,
+                            'duration': r.actual_duration,
+                            'metrics': r.metrics,
+                            'error_count': len(r.errors)
+                        }
+                        for r in results
+                    ]
+                }
+            })
+        except Exception as e:
+            logger.error("Error running batch scenarios: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/status')
+    def get_scenario_gen_status():
+        """Get scenario generator status and last result."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            return jsonify({
+                'library': {
+                    'template_count': len(sim_state.scenario_library.list_templates()),
+                    'categories': [c.name for c in ScenarioCategory]
+                },
+                'generator': {
+                    'available': True
+                },
+                'executor': {
+                    'is_running': sim_state.scenario_executor._running,
+                    'current_time': sim_state.scenario_executor._current_time
+                },
+                'last_result': sim_state._current_scenario_result
+            })
+        except Exception as e:
+            logger.error("Error getting scenario gen status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/sequence', methods=['POST'])
+    def create_scenario_sequence():
+        """Create and execute a sequence of scenarios."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            sequence = data.get('sequence', [])
+
+            if not sequence:
+                return jsonify({'error': 'sequence is required (list of template_ids)'}), 400
+
+            results = []
+            for item in sequence:
+                if isinstance(item, str):
+                    template_id = item
+                    params = {}
+                else:
+                    template_id = item.get('template_id')
+                    params = item.get('parameters', {})
+
+                scenario = sim_state.scenario_generator.generate_from_template(
+                    template_id,
+                    parameter_overrides=params
+                )
+                result = sim_state.scenario_executor.execute(scenario)
+                results.append({
+                    'scenario_id': result.scenario_id,
+                    'template_id': template_id,
+                    'success': result.success,
+                    'duration': result.actual_duration,
+                    'metrics': result.metrics
+                })
+
+            return jsonify({
+                'status': 'ok',
+                'sequence_results': {
+                    'total': len(results),
+                    'passed': sum(1 for r in results if r['success']),
+                    'results': results
+                }
+            })
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            logger.error("Error executing scenario sequence: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/scenario_gen/categories')
+    def get_scenario_categories():
+        """Get list of available scenario categories."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            categories = {}
+            for cat in ScenarioCategory:
+                templates = sim_state.scenario_library.get_by_category(cat)
+                categories[cat.name] = {
+                    'count': len(templates),
+                    'severities': list(set(t.severity.name for t in templates))
+                }
+
+            return jsonify({
+                'categories': categories,
+                'severity_levels': [s.name for s in ScenarioSeverity]
+            })
+        except Exception as e:
+            logger.error("Error getting scenario categories: %s", e)
             return jsonify({'error': str(e)}), 500
 
     return app
