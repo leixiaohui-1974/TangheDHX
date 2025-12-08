@@ -82,6 +82,15 @@ from src.optimization.optimizer import (
     ParameterSpec,
     ParameterBounds
 )
+from src.sensor_prediction.predictor import (
+    SensorPredictionManager,
+    SensorConfig,
+    SensorType,
+    NoiseModel,
+    FailureMode,
+    PredictionMethod,
+    VirtualSensorConfig
+)
 from datetime import datetime
 
 # Configure logging
@@ -224,6 +233,14 @@ class SimulationState:
             self.local_ctrl,
             opt_config
         )
+
+        # Sensor simulation and state prediction system
+        self.sensor_prediction = SensorPredictionManager({
+            'prediction_method': PredictionMethod.ENSEMBLE.value,
+            'history_size': 200,
+            'update_interval_ms': 100
+        })
+        self._init_prediction_sensors()
 
         logger.info("SimulationState initialized with full feature set including extended modules")
 
@@ -390,6 +407,108 @@ class SimulationState:
         self.twin_sync.set_discrepancy_threshold('total_flow', 0.05)  # 5%
         self.twin_sync.set_discrepancy_threshold('head_upstream', 0.02)  # 2%
         self.twin_sync.set_discrepancy_threshold('head_downstream', 0.02)  # 2%
+
+    def _init_prediction_sensors(self) -> None:
+        """Initialize sensors for simulation and state prediction."""
+        # Flow sensors
+        self.sensor_prediction.register_sensor(SensorConfig(
+            sensor_id='flow_upstream',
+            sensor_type=SensorType.FLOW_METER,
+            name='Upstream Flow Meter',
+            unit='m³/s',
+            min_value=0.0,
+            max_value=100.0,
+            noise_level=0.02,
+            drift_rate=0.001
+        ))
+
+        self.sensor_prediction.register_sensor(SensorConfig(
+            sensor_id='flow_downstream',
+            sensor_type=SensorType.FLOW_METER,
+            name='Downstream Flow Meter',
+            unit='m³/s',
+            min_value=0.0,
+            max_value=100.0,
+            noise_level=0.02,
+            drift_rate=0.001
+        ))
+
+        # Pressure sensors
+        self.sensor_prediction.register_sensor(SensorConfig(
+            sensor_id='pressure_inlet',
+            sensor_type=SensorType.PRESSURE_SENSOR,
+            name='Inlet Pressure Sensor',
+            unit='kPa',
+            min_value=0.0,
+            max_value=500.0,
+            noise_level=0.01,
+            drift_rate=0.0005
+        ))
+
+        self.sensor_prediction.register_sensor(SensorConfig(
+            sensor_id='pressure_outlet',
+            sensor_type=SensorType.PRESSURE_SENSOR,
+            name='Outlet Pressure Sensor',
+            unit='kPa',
+            min_value=0.0,
+            max_value=500.0,
+            noise_level=0.01,
+            drift_rate=0.0005
+        ))
+
+        # Water level sensors
+        self.sensor_prediction.register_sensor(SensorConfig(
+            sensor_id='level_upstream',
+            sensor_type=SensorType.LEVEL_SENSOR,
+            name='Upstream Water Level',
+            unit='m',
+            min_value=0.0,
+            max_value=20.0,
+            noise_level=0.005,
+            drift_rate=0.0002
+        ))
+
+        self.sensor_prediction.register_sensor(SensorConfig(
+            sensor_id='level_downstream',
+            sensor_type=SensorType.LEVEL_SENSOR,
+            name='Downstream Water Level',
+            unit='m',
+            min_value=0.0,
+            max_value=20.0,
+            noise_level=0.005,
+            drift_rate=0.0002
+        ))
+
+        # Velocity sensor
+        self.sensor_prediction.register_sensor(SensorConfig(
+            sensor_id='velocity_main',
+            sensor_type=SensorType.VELOCITY_SENSOR,
+            name='Main Velocity Sensor',
+            unit='m/s',
+            min_value=0.0,
+            max_value=10.0,
+            noise_level=0.03,
+            drift_rate=0.001
+        ))
+
+        # Virtual sensors
+        self.sensor_prediction.register_virtual_sensor(VirtualSensorConfig(
+            sensor_id='avg_flow',
+            name='Average Flow (Virtual)',
+            unit='m³/s',
+            source_sensors=['flow_upstream', 'flow_downstream'],
+            fusion_method='weighted_average',
+            weights=[0.5, 0.5]
+        ))
+
+        self.sensor_prediction.register_virtual_sensor(VirtualSensorConfig(
+            sensor_id='pressure_diff',
+            name='Pressure Difference (Virtual)',
+            unit='kPa',
+            source_sensors=['pressure_inlet', 'pressure_outlet'],
+            fusion_method='formula',
+            formula='pressure_inlet - pressure_outlet'
+        ))
 
     @property
     def running(self) -> bool:
@@ -3243,6 +3362,309 @@ def create_app() -> Flask:
         return jsonify({
             'algorithms': [algo.name for algo in OptimizationAlgorithm]
         })
+
+    # ==================== Sensor Prediction API ====================
+
+    @app.route('/api/sensor_prediction/status')
+    def get_sensor_prediction_status():
+        """Get sensor prediction system status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.sensor_prediction.get_status()
+            return jsonify(status)
+        except Exception as e:
+            logger.error("Error getting sensor prediction status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/sensors')
+    def list_prediction_sensors():
+        """List all registered sensors."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            sensors = sim_state.sensor_prediction.list_sensors()
+            virtual_sensors = sim_state.sensor_prediction.list_virtual_sensors()
+            return jsonify({
+                'physical_sensors': sensors,
+                'virtual_sensors': virtual_sensors
+            })
+        except Exception as e:
+            logger.error("Error listing sensors: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/simulate', methods=['POST'])
+    def simulate_sensor_readings():
+        """Simulate sensor readings with optional true values."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            true_values = data.get('true_values')
+
+            readings = sim_state.sensor_prediction.simulate_all(true_values)
+
+            result = {}
+            for sensor_id, reading in readings.items():
+                result[sensor_id] = {
+                    'value': reading.value if not (reading.value != reading.value) else None,
+                    'raw_value': reading.raw_value,
+                    'quality': reading.quality,
+                    'is_valid': reading.is_valid,
+                    'failure_mode': reading.failure_mode.name,
+                    'timestamp': reading.timestamp.isoformat()
+                }
+
+            # Include virtual sensor values
+            virtual_values = sim_state.sensor_prediction.get_all_virtual_sensor_values()
+            for vs_id, value in virtual_values.items():
+                result[vs_id] = {
+                    'value': value,
+                    'is_virtual': True
+                }
+
+            return jsonify({'readings': result})
+        except Exception as e:
+            logger.error("Error simulating sensors: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/predict/<sensor_id>', methods=['POST'])
+    def predict_sensor_state(sensor_id):
+        """Predict future sensor state."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            horizon_seconds = data.get('horizon_seconds', 10.0)
+            num_points = data.get('num_points', 10)
+
+            result = sim_state.sensor_prediction.predict(
+                sensor_id, horizon_seconds, num_points
+            )
+
+            if result is None:
+                return jsonify({'error': 'Insufficient data for prediction'}), 400
+
+            return jsonify({
+                'sensor_id': result.sensor_id,
+                'prediction_horizon_seconds': result.prediction_horizon_seconds,
+                'predicted_values': result.predicted_values,
+                'timestamps': [t.isoformat() for t in result.timestamps],
+                'confidence_intervals': result.confidence_intervals,
+                'method': result.method.name,
+                'accuracy_estimate': result.accuracy_estimate
+            })
+        except Exception as e:
+            logger.error("Error predicting sensor state: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/health/<sensor_id>')
+    def get_sensor_health(sensor_id):
+        """Get sensor health report."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            report = sim_state.sensor_prediction.get_health_report(sensor_id)
+
+            if report is None:
+                return jsonify({'error': 'Insufficient data for health evaluation'}), 400
+
+            return jsonify({
+                'sensor_id': report.sensor_id,
+                'timestamp': report.timestamp.isoformat(),
+                'health': report.health.name,
+                'health_score': report.health_score,
+                'issues': report.issues,
+                'recommendations': report.recommendations,
+                'metrics': report.metrics,
+                'trend': report.trend
+            })
+        except Exception as e:
+            logger.error("Error getting sensor health: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/health')
+    def get_all_sensor_health():
+        """Get health reports for all sensors."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            reports = sim_state.sensor_prediction.get_all_health_reports()
+
+            result = {}
+            for sensor_id, report in reports.items():
+                result[sensor_id] = {
+                    'health': report.health.name,
+                    'health_score': report.health_score,
+                    'trend': report.trend,
+                    'issues': report.issues
+                }
+
+            return jsonify({'health_reports': result})
+        except Exception as e:
+            logger.error("Error getting all sensor health: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/inject_failure', methods=['POST'])
+    def inject_sensor_failure():
+        """Inject a failure into a sensor for testing."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Request body required'}), 400
+
+            sensor_id = data.get('sensor_id')
+            failure_mode_name = data.get('failure_mode')
+
+            if not sensor_id or not failure_mode_name:
+                return jsonify({'error': 'sensor_id and failure_mode required'}), 400
+
+            try:
+                failure_mode = FailureMode[failure_mode_name]
+            except KeyError:
+                return jsonify({
+                    'error': f'Invalid failure_mode. Valid: {[fm.name for fm in FailureMode]}'
+                }), 400
+
+            success = sim_state.sensor_prediction.inject_failure(sensor_id, failure_mode)
+
+            if not success:
+                return jsonify({'error': 'Sensor not found'}), 404
+
+            return jsonify({
+                'success': True,
+                'sensor_id': sensor_id,
+                'failure_mode': failure_mode.name
+            })
+        except Exception as e:
+            logger.error("Error injecting failure: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/clear_failure', methods=['POST'])
+    def clear_sensor_failure():
+        """Clear failure from a sensor."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Request body required'}), 400
+
+            sensor_id = data.get('sensor_id')
+            if not sensor_id:
+                return jsonify({'error': 'sensor_id required'}), 400
+
+            success = sim_state.sensor_prediction.clear_failure(sensor_id)
+
+            if not success:
+                return jsonify({'error': 'Sensor not found'}), 404
+
+            return jsonify({'success': True, 'sensor_id': sensor_id})
+        except Exception as e:
+            logger.error("Error clearing failure: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/calibrate', methods=['POST'])
+    def calibrate_sensor():
+        """Calibrate a sensor."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Request body required'}), 400
+
+            sensor_id = data.get('sensor_id')
+            if not sensor_id:
+                return jsonify({'error': 'sensor_id required'}), 400
+
+            success = sim_state.sensor_prediction.calibrate_sensor(sensor_id)
+
+            if not success:
+                return jsonify({'error': 'Sensor not found'}), 404
+
+            return jsonify({'success': True, 'sensor_id': sensor_id})
+        except Exception as e:
+            logger.error("Error calibrating sensor: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/state/<sensor_id>')
+    def get_sensor_state(sensor_id):
+        """Get current sensor state."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            state = sim_state.sensor_prediction.get_sensor_state(sensor_id)
+
+            if state is None:
+                return jsonify({'error': 'Sensor not found'}), 404
+
+            return jsonify({
+                'sensor_id': state.sensor_id,
+                'true_value': state.true_value,
+                'measured_value': state.measured_value,
+                'noise': state.noise,
+                'bias': state.bias,
+                'drift': state.drift,
+                'failure_mode': state.failure_mode.name,
+                'last_calibration': state.last_calibration.isoformat(),
+                'operating_hours': state.operating_hours,
+                'health': state.health.name
+            })
+        except Exception as e:
+            logger.error("Error getting sensor state: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/sensor_prediction/prediction_methods')
+    def get_prediction_methods():
+        """Get list of available prediction methods."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        return jsonify({
+            'methods': [method.name for method in PredictionMethod]
+        })
+
+    @app.route('/api/sensor_prediction/set_method', methods=['POST'])
+    def set_prediction_method():
+        """Set the prediction method."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Request body required'}), 400
+
+            method_name = data.get('method')
+            if not method_name:
+                return jsonify({'error': 'method required'}), 400
+
+            try:
+                method = PredictionMethod[method_name]
+            except KeyError:
+                return jsonify({
+                    'error': f'Invalid method. Valid: {[m.name for m in PredictionMethod]}'
+                }), 400
+
+            sim_state.sensor_prediction.set_prediction_method(method)
+
+            return jsonify({'success': True, 'method': method.name})
+        except Exception as e:
+            logger.error("Error setting prediction method: %s", e)
+            return jsonify({'error': str(e)}), 500
 
     return app
 
