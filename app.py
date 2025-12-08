@@ -75,6 +75,13 @@ from src.twin_sync.synchronizer import (
     SyncQuality,
     SourceType
 )
+from src.optimization.optimizer import (
+    AutoTuner,
+    OptimizationAlgorithm,
+    OptimizationConfig,
+    ParameterSpec,
+    ParameterBounds
+)
 from datetime import datetime
 
 # Configure logging
@@ -205,6 +212,18 @@ class SimulationState:
             config={'mode': 'ON_DEMAND', 'sync_interval_ms': 100.0}
         )
         self._init_sync_sources()
+
+        # Automated optimization/tuning system
+        opt_config = OptimizationConfig(
+            max_iterations=50,
+            timeout_seconds=300.0,
+            population_size=20
+        )
+        self.auto_tuner = AutoTuner(
+            self.model,
+            self.local_ctrl,
+            opt_config
+        )
 
         logger.info("SimulationState initialized with full feature set including extended modules")
 
@@ -3017,6 +3036,213 @@ def create_app() -> Flask:
         except Exception as e:
             logger.error("Error setting threshold: %s", e)
             return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Automated Optimization API Endpoints
+    # =========================================================================
+
+    @app.route('/api/optimization/status')
+    def get_optimization_status():
+        """Get optimization system status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.auto_tuner.get_status()
+            return jsonify(status)
+        except Exception as e:
+            logger.error("Error getting optimization status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/optimization/tune_pid', methods=['POST'])
+    def tune_pid():
+        """Run PID controller tuning."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+
+            algo_name = data.get('algorithm', 'BAYESIAN')
+            try:
+                algorithm = OptimizationAlgorithm[algo_name.upper()]
+            except KeyError:
+                return jsonify({'error': f'Invalid algorithm: {algo_name}'}), 400
+
+            result = sim_state.auto_tuner.tune_pid(
+                algorithm=algorithm,
+                kp_bounds=tuple(data.get('kp_bounds', [0.1, 10.0])),
+                ki_bounds=tuple(data.get('ki_bounds', [0.0, 5.0])),
+                kd_bounds=tuple(data.get('kd_bounds', [0.0, 2.0])),
+                simulation_time=data.get('simulation_time', 100.0),
+                target_flow=data.get('target_flow', 150.0)
+            )
+
+            if result is None:
+                return jsonify({'error': 'Optimization already running'}), 409
+
+            return jsonify({
+                'status': 'ok',
+                'result': {
+                    'result_id': result.result_id,
+                    'algorithm': result.algorithm.name,
+                    'status': result.status.name,
+                    'best_params': result.best_params,
+                    'best_value': result.best_value,
+                    'iterations': result.iterations,
+                    'elapsed_seconds': result.elapsed_seconds
+                }
+            })
+        except Exception as e:
+            logger.error("Error tuning PID: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/optimization/tune_mpc', methods=['POST'])
+    def tune_mpc():
+        """Run MPC controller tuning."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+
+            algo_name = data.get('algorithm', 'BAYESIAN')
+            try:
+                algorithm = OptimizationAlgorithm[algo_name.upper()]
+            except KeyError:
+                return jsonify({'error': f'Invalid algorithm: {algo_name}'}), 400
+
+            result = sim_state.auto_tuner.tune_mpc(
+                algorithm=algorithm,
+                q_bounds=tuple(data.get('q_bounds', [0.1, 100.0])),
+                r_bounds=tuple(data.get('r_bounds', [0.01, 10.0])),
+                simulation_time=data.get('simulation_time', 100.0),
+                target_flow=data.get('target_flow', 150.0)
+            )
+
+            if result is None:
+                return jsonify({'error': 'Optimization already running'}), 409
+
+            return jsonify({
+                'status': 'ok',
+                'result': {
+                    'result_id': result.result_id,
+                    'algorithm': result.algorithm.name,
+                    'status': result.status.name,
+                    'best_params': result.best_params,
+                    'best_value': result.best_value,
+                    'iterations': result.iterations,
+                    'elapsed_seconds': result.elapsed_seconds
+                }
+            })
+        except Exception as e:
+            logger.error("Error tuning MPC: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/optimization/custom', methods=['POST'])
+    def run_custom_optimization():
+        """Run custom parameter optimization."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+
+            # Parse parameters
+            param_specs = data.get('parameters', [])
+            if not param_specs:
+                return jsonify({'error': 'parameters are required'}), 400
+
+            parameters = []
+            for spec in param_specs:
+                bounds = ParameterBounds(spec['min'], spec['max'])
+                parameters.append(ParameterSpec(
+                    name=spec['name'],
+                    bounds=bounds,
+                    initial=spec.get('initial'),
+                    is_integer=spec.get('is_integer', False)
+                ))
+
+            algo_name = data.get('algorithm', 'BAYESIAN')
+            try:
+                algorithm = OptimizationAlgorithm[algo_name.upper()]
+            except KeyError:
+                return jsonify({'error': f'Invalid algorithm: {algo_name}'}), 400
+
+            # Define objective based on type
+            objective_type = data.get('objective_type', 'flow_tracking')
+
+            def objective(params):
+                # Simple flow tracking objective
+                state = sim_state.model.get_state()
+                target = data.get('target_flow', 150.0)
+                error = (state.get('total_flow', 0) - target) ** 2
+                return error
+
+            result = sim_state.auto_tuner.custom_optimize(
+                parameters,
+                objective,
+                algorithm=algorithm,
+                task_name=data.get('task_name', 'custom')
+            )
+
+            if result is None:
+                return jsonify({'error': 'Optimization already running'}), 409
+
+            return jsonify({
+                'status': 'ok',
+                'result': {
+                    'result_id': result.result_id,
+                    'algorithm': result.algorithm.name,
+                    'status': result.status.name,
+                    'best_params': result.best_params,
+                    'best_value': result.best_value,
+                    'iterations': result.iterations,
+                    'elapsed_seconds': result.elapsed_seconds
+                }
+            })
+        except Exception as e:
+            logger.error("Error in custom optimization: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/optimization/history')
+    def get_optimization_history():
+        """Get optimization history."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            history = sim_state.auto_tuner.get_history()
+            limit = request.args.get('limit', 10, type=int)
+
+            return jsonify({
+                'statistics': history.get_statistics(),
+                'recent': [
+                    {
+                        'result_id': r.result_id,
+                        'algorithm': r.algorithm.name,
+                        'status': r.status.name,
+                        'best_value': r.best_value,
+                        'iterations': r.iterations,
+                        'elapsed_seconds': r.elapsed_seconds,
+                        'timestamp': r.timestamp
+                    }
+                    for r in history.get_recent(limit)
+                ]
+            })
+        except Exception as e:
+            logger.error("Error getting optimization history: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/optimization/algorithms')
+    def get_optimization_algorithms():
+        """Get list of available optimization algorithms."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        return jsonify({
+            'algorithms': [algo.name for algo in OptimizationAlgorithm]
+        })
 
     return app
 
