@@ -53,7 +53,7 @@ from src.data.assimilation import (
 # Import state management modules
 from src.control.model_calibration import IDZModelCalibrator, IDZModelConfig
 from src.control.state_evaluation import (
-    RealTimeStateEvaluator, ControlObjective, EvaluationLevel
+    RealTimeStateEvaluator, ControlObjective, EvaluationLevel, ObjectiveType
 )
 from src.control.state_prediction import (
     RealTimeStatePredictor, StatePredictor, TrendPredictor,
@@ -515,8 +515,7 @@ class TestDataGovernanceAssimilationIntegration:
             if quality.overall > 0.5:
                 data_assimilation.assimilate(
                     physics_model,
-                    {'flow_rate_0': cleaned_data.get('flow_rate', 0) / 3.0},
-                    timestamp=step * dt
+                    {'flow_rate_0': cleaned_data.get('flow_rate', 0) / 3.0}
                 )
 
         # Check quality
@@ -590,8 +589,7 @@ class TestDataGovernanceAssimilationIntegration:
             # Assimilate observation
             result = data_assimilation.assimilate(
                 physics_model,
-                {'flow_rate_0': observed_flow / 3.0},
-                timestamp=step * dt
+                {'flow_rate_0': observed_flow / 3.0}
             )
 
             estimation_results.append(result)
@@ -624,16 +622,22 @@ class TestModelCalibrationInLoop:
             gate_openings = state['openings']
             upstream_head = 10.0
 
-            # Update calibrator
-            model_calibrator.update(
-                measured_flow=measured_flow,
-                gate_openings=gate_openings,
-                upstream_head=upstream_head,
+            # Update calibrator using high-fidelity state
+            hifi_state = {
+                'flows': state['flows'],
+                'velocities': state['velocities'],
+                'vibrations': state['vibrations'],
+                'openings': gate_openings
+            }
+            idz_state = hifi_state.copy()  # In test, same as hifi
+
+            result = model_calibrator.update_from_high_fidelity(
+                hifi_state=hifi_state,
+                idz_state=idz_state,
                 timestamp=step * dt
             )
 
-            params = model_calibrator.get_parameters()
-            parameter_history.append(params.copy())
+            parameter_history.append(result.parameters.copy())
 
         # Check convergence
         if len(parameter_history) > 10:
@@ -652,17 +656,22 @@ class TestModelCalibrationInLoop:
         for step in range(100):
             physics_model.step(current_openings, dt)
             state = physics_model.get_state()
-            measured_flow = np.sum(state['flows']) + np.random.normal(0, 0.5)
 
-            model_calibrator.update(
-                measured_flow=measured_flow,
-                gate_openings=state['openings'],
-                upstream_head=10.0,
+            hifi_state = {
+                'flows': state['flows'],
+                'velocities': state['velocities'],
+                'vibrations': state['vibrations'],
+                'openings': state['openings']
+            }
+
+            result = model_calibrator.update_from_high_fidelity(
+                hifi_state=hifi_state,
+                idz_state=hifi_state,
                 timestamp=step * dt
             )
 
         # Get calibrated parameters
-        calibrated_params = model_calibrator.get_parameters()
+        calibrated_params = result.parameters
         print(f"Calibrated Cd: {calibrated_params.get('discharge_coefficient', 'N/A')}")
 
     def test_online_recalibration(self, physics_model, model_calibrator):
@@ -675,30 +684,48 @@ class TestModelCalibrationInLoop:
         for step in range(100):
             physics_model.step(current_openings, dt)
             state = physics_model.get_state()
-            model_calibrator.update(
-                measured_flow=np.sum(state['flows']),
-                gate_openings=state['openings'],
-                upstream_head=10.0,
+
+            hifi_state = {
+                'flows': state['flows'],
+                'velocities': state['velocities'],
+                'vibrations': state['vibrations'],
+                'openings': state['openings']
+            }
+
+            result = model_calibrator.update_from_high_fidelity(
+                hifi_state=hifi_state,
+                idz_state=hifi_state,
                 timestamp=step * dt
             )
 
-        params_phase1 = model_calibrator.get_parameters()
+        params_phase1 = result.parameters
 
         # Phase 2: Changed conditions (simulate drift)
         for step in range(100, 200):
             physics_model.step(current_openings, dt)
             state = physics_model.get_state()
-            # Simulate reduced efficiency
-            measured_flow = np.sum(state['flows']) * 0.9
 
-            model_calibrator.update(
-                measured_flow=measured_flow,
-                gate_openings=state['openings'],
-                upstream_head=10.0,
+            # Simulate IDZ model with reduced efficiency
+            hifi_state = {
+                'flows': state['flows'],
+                'velocities': state['velocities'],
+                'vibrations': state['vibrations'],
+                'openings': state['openings']
+            }
+            idz_state = {
+                'flows': [f * 0.9 for f in state['flows']],
+                'velocities': state['velocities'],
+                'vibrations': state['vibrations'],
+                'openings': state['openings']
+            }
+
+            result = model_calibrator.update_from_high_fidelity(
+                hifi_state=hifi_state,
+                idz_state=idz_state,
                 timestamp=step * dt
             )
 
-        params_phase2 = model_calibrator.get_parameters()
+        params_phase2 = result.parameters
 
         print(f"Phase 1 Cd: {params_phase1.get('discharge_coefficient', 0.62):.4f}")
         print(f"Phase 2 Cd: {params_phase2.get('discharge_coefficient', 0.62):.4f}")
@@ -716,10 +743,11 @@ class TestStateEvaluationPredictionLoop:
         physics_model.reset()
         dt = 0.1
 
-        # Add control objective
-        state_evaluator.add_objective(ControlObjective(
+        # Add control objective via objective_manager
+        state_evaluator.objective_manager.add_objective(ControlObjective(
             name="flow_tracking",
-            target=100.0,
+            type=ObjectiveType.FLOW_TRACKING,
+            target_value=100.0,
             tolerance=10.0,
             weight=1.0
         ))
@@ -732,18 +760,10 @@ class TestStateEvaluationPredictionLoop:
             current_openings = np.array([opening, opening, opening])
 
             physics_model.step(current_openings, dt)
-            state = physics_model.get_state()
 
-            # Evaluate
-            current_flow = np.sum(state['flows'])
-            current_state = {
-                'flow': current_flow,
-                'vibration': np.max(state['vibrations']),
-                'velocity': np.mean(state['velocities'])
-            }
-
-            evaluation = state_evaluator.evaluate(current_state, step * dt)
-            evaluation_levels.append(evaluation.level.name)
+            # Evaluate using model
+            evaluation = state_evaluator.evaluate(physics_model, target_flow=100.0)
+            evaluation_levels.append(evaluation.performance.level.name)
 
         # Should have some evaluations
         unique_levels = set(evaluation_levels)
@@ -759,18 +779,13 @@ class TestStateEvaluationPredictionLoop:
             current_openings = np.array([min(opening, 4.0)] * 3)
 
             physics_model.step(current_openings, dt)
-            state = physics_model.get_state()
 
-            # Update predictor
-            current_flow = np.sum(state['flows'])
-            state_predictor.update({
-                'flow': current_flow,
-                'vibration': np.max(state['vibrations'])
-            }, step * dt)
+            # Update predictor observations
+            state_predictor.update_observations()
 
             # Get prediction
             if step > 10:
-                prediction = state_predictor.predict(horizon=5.0)
+                prediction = state_predictor.predict(horizon_seconds=5.0)
 
         print("State prediction test completed successfully")
 
@@ -779,10 +794,11 @@ class TestStateEvaluationPredictionLoop:
         physics_model.reset()
         dt = 0.1
 
-        # Add objective
-        state_evaluator.add_objective(ControlObjective(
+        # Add objective via objective_manager
+        state_evaluator.objective_manager.add_objective(ControlObjective(
             name="flow",
-            target=100.0,
+            type=ObjectiveType.FLOW_TRACKING,
+            target_value=100.0,
             tolerance=15.0,
             weight=1.0
         ))
@@ -792,19 +808,15 @@ class TestStateEvaluationPredictionLoop:
         for step in range(150):
             current_openings = np.array([2.0, 2.0, 2.0])
             physics_model.step(current_openings, dt)
-            state = physics_model.get_state()
-
-            current_flow = np.sum(state['flows'])
-            current_state = {'flow': current_flow}
 
             # Evaluate current state
-            evaluation = state_evaluator.evaluate(current_state, step * dt)
+            evaluation = state_evaluator.evaluate(physics_model, target_flow=100.0)
 
             # Update predictor
-            state_predictor.update(current_state, step * dt)
+            state_predictor.update_observations()
 
             # Decision logic
-            if evaluation.level in [EvaluationLevel.WARNING, EvaluationLevel.CRITICAL]:
+            if evaluation.performance.level in [EvaluationLevel.WARNING, EvaluationLevel.CRITICAL]:
                 control_actions += 1
 
         print(f"Control actions triggered: {control_actions}")
@@ -850,14 +862,14 @@ class TestAllScenarios:
         if 'initial_flow' in config:
             # Set initial conditions for transitions
             initial_opening = config['initial_flow'] / 50.0
-            model._state['openings'] = np.array([min(initial_opening, 4.5)] * 3)
+            model.gate_openings = np.array([min(initial_opening, 4.5)] * 3)
 
         if 'stuck_gate' in config:
-            model.inject_fault(config['stuck_gate'])
+            model.inject_fault(config['stuck_gate'], 'stuck')
 
         if 'stuck_gates' in config:
             for gate in config['stuck_gates']:
-                model.inject_fault(gate)
+                model.inject_fault(gate, 'stuck')
 
         # Run scenario
         flow_history = []
@@ -950,8 +962,14 @@ class TestFullSystemIntegration:
         evaluator = RealTimeStateEvaluator()
         predictor = RealTimeStatePredictor(physics_model)
 
-        # Set objectives
-        evaluator.add_objective(ControlObjective("flow", 100.0, 10.0, 1.0))
+        # Set objectives via objective_manager
+        evaluator.objective_manager.add_objective(ControlObjective(
+            name="flow",
+            type=ObjectiveType.FLOW_TRACKING,
+            target_value=100.0,
+            tolerance=10.0,
+            weight=1.0
+        ))
 
         physics_model.reset()
         dt = 0.1
@@ -984,24 +1002,31 @@ class TestFullSystemIntegration:
             if quality.overall > 0.5:
                 assimilation.assimilate(
                     physics_model,
-                    {'flow_rate_0': cleaned.get('flow_rate', 0) / 3.0},
-                    timestamp=step * dt
+                    {'flow_rate_0': cleaned.get('flow_rate', 0) / 3.0}
                 )
 
-            # 4. Model calibration
-            calibrator.update(
-                measured_flow=np.sum(state['flows']),
-                gate_openings=state['openings'],
-                upstream_head=10.0,
+            # 4. Model calibration (using high-fidelity update)
+            hifi_state = {
+                'flow': np.sum(state['flows']),
+                'velocity': np.mean(state['velocities']),
+                'water_level': np.mean(state['openings']) * 2
+            }
+            idz_state = {
+                'flow': np.sum(state['flows']) * 1.02,
+                'velocity': np.mean(state['velocities']) * 0.98
+            }
+            calibrator.update_from_high_fidelity(
+                hifi_state=hifi_state,
+                idz_state=idz_state,
                 timestamp=step * dt
             )
 
             # 5. State evaluation
             current_flow = np.sum(state['flows'])
-            evaluation = evaluator.evaluate({'flow': current_flow}, step * dt)
+            evaluation = evaluator.evaluate(physics_model, target_flow=100.0)
 
             # 6. State prediction
-            predictor.update({'flow': current_flow}, step * dt)
+            predictor.update_observations()
 
             # 7. Control update
             controller.set_target_flow(100.0)
@@ -1088,7 +1113,7 @@ class TestFullSystemIntegration:
         pre_fault_flow = np.sum(physics_model.get_state()['flows'])
 
         # Inject fault
-        physics_model.inject_fault(1)
+        physics_model.inject_fault(1, 'stuck')
 
         # Operate with fault
         for _ in range(50):
@@ -1099,7 +1124,7 @@ class TestFullSystemIntegration:
         fault_flow = np.sum(physics_model.get_state()['flows'])
 
         # Clear fault
-        physics_model.clear_fault(1)
+        physics_model.inject_fault(1, 'clear')
 
         # Recovery
         for _ in range(100):
@@ -1288,8 +1313,8 @@ class TestEdgeCasesAndStress:
             physics_model.step(state['openings'], dt)
 
         # Inject multiple faults
-        physics_model.inject_fault(0)
-        physics_model.inject_fault(2)
+        physics_model.inject_fault(0, 'stuck')
+        physics_model.inject_fault(2, 'stuck')
 
         # Try to operate with 2/3 gates stuck
         for _ in range(50):
