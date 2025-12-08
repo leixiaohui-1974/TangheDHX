@@ -48,6 +48,13 @@ from src.maintenance.predictive_maintenance import (
     WeibullDegradation,
     ExponentialDegradation
 )
+from src.analytics.reporting import (
+    AnalyticsEngine,
+    ReportType,
+    ReportFormat,
+    AlarmSeverity,
+    AlarmCategory
+)
 from datetime import datetime
 
 # Configure logging
@@ -154,6 +161,9 @@ class SimulationState:
             planning_horizon_days=30
         )
         self._init_maintenance_equipment()
+
+        # Analytics and reporting engine
+        self.analytics = AnalyticsEngine(history_hours=720)  # 30 days history
 
         logger.info("SimulationState initialized with full feature set including extended modules")
 
@@ -1839,6 +1849,255 @@ def create_app() -> Flask:
             })
         except Exception as e:
             logger.error("Error recording maintenance: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Analytics and Reporting API Endpoints
+    # =========================================================================
+
+    @app.route('/api/analytics/dashboard')
+    def get_analytics_dashboard():
+        """Get analytics dashboard data."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            dashboard = sim_state.analytics.get_dashboard_data()
+            return jsonify(dashboard)
+        except Exception as e:
+            logger.error("Error getting dashboard data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/kpis')
+    def get_all_kpis():
+        """Get all current KPI values."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            kpis = sim_state.analytics.kpi_tracker.get_all_current()
+            return jsonify({
+                'count': len(kpis),
+                'kpis': {
+                    name: {
+                        'value': v.value,
+                        'target': v.target,
+                        'deviation_pct': v.deviation_pct,
+                        'status': v.status,
+                        'trend': v.trend
+                    }
+                    for name, v in kpis.items()
+                }
+            })
+        except Exception as e:
+            logger.error("Error getting KPIs: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/kpis/alerts')
+    def get_kpi_alerts():
+        """Get KPIs in warning or critical status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            alerts = sim_state.analytics.kpi_tracker.get_alerts()
+            return jsonify({
+                'count': len(alerts),
+                'alerts': [
+                    {
+                        'name': a.name,
+                        'value': a.value,
+                        'target': a.target,
+                        'status': a.status,
+                        'trend': a.trend
+                    }
+                    for a in alerts
+                ]
+            })
+        except Exception as e:
+            logger.error("Error getting KPI alerts: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/alarms')
+    def get_analytics_alarms():
+        """Get alarm statistics and active alarms."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            stats = sim_state.analytics.alarm_manager.get_statistics(24)
+            active = sim_state.analytics.alarm_manager.get_active()
+            return jsonify({
+                'statistics': stats,
+                'active_alarms': [
+                    {
+                        'event_id': a.event_id,
+                        'timestamp': a.timestamp.isoformat(),
+                        'severity': a.severity.name,
+                        'category': a.category.name,
+                        'source': a.source,
+                        'message': a.message,
+                        'acknowledged': a.acknowledged
+                    }
+                    for a in active
+                ]
+            })
+        except Exception as e:
+            logger.error("Error getting alarms: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/alarms/acknowledge', methods=['POST'])
+    def acknowledge_alarm():
+        """Acknowledge an alarm."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            event_id = data.get('event_id')
+            acknowledged_by = data.get('acknowledged_by', 'api_user')
+
+            if not event_id:
+                return jsonify({'error': 'event_id is required'}), 400
+
+            result = sim_state.analytics.alarm_manager.acknowledge(event_id, acknowledged_by)
+            if result:
+                return jsonify({'status': 'success', 'message': f'Alarm {event_id} acknowledged'})
+            else:
+                return jsonify({'error': f'Alarm {event_id} not found'}), 404
+        except Exception as e:
+            logger.error("Error acknowledging alarm: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/alarms/clear', methods=['POST'])
+    def clear_alarm():
+        """Clear an alarm."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            event_id = data.get('event_id')
+
+            if not event_id:
+                return jsonify({'error': 'event_id is required'}), 400
+
+            result = sim_state.analytics.alarm_manager.clear(event_id)
+            if result:
+                return jsonify({'status': 'success', 'message': f'Alarm {event_id} cleared'})
+            else:
+                return jsonify({'error': f'Alarm {event_id} not found'}), 404
+        except Exception as e:
+            logger.error("Error clearing alarm: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/report')
+    def generate_report():
+        """Generate analytics report."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            report_type_str = request.args.get('type', 'daily')
+            format_str = request.args.get('format', 'json')
+
+            # Map strings to enums
+            type_map = {
+                'daily': ReportType.DAILY,
+                'weekly': ReportType.WEEKLY,
+                'monthly': ReportType.MONTHLY,
+                'performance': ReportType.PERFORMANCE
+            }
+            format_map = {
+                'json': ReportFormat.JSON,
+                'text': ReportFormat.TEXT,
+                'html': ReportFormat.HTML
+            }
+
+            report_type = type_map.get(report_type_str, ReportType.DAILY)
+            report_format = format_map.get(format_str, ReportFormat.JSON)
+
+            report = sim_state.analytics.generate_report(report_type, report_format)
+
+            if report_format == ReportFormat.HTML:
+                return report, 200, {'Content-Type': 'text/html'}
+            elif report_format == ReportFormat.TEXT:
+                return report, 200, {'Content-Type': 'text/plain'}
+            else:
+                return report, 200, {'Content-Type': 'application/json'}
+        except Exception as e:
+            logger.error("Error generating report: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/statistics')
+    def get_operation_statistics():
+        """Get operation statistics summary."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            hours = request.args.get('hours', 24, type=int)
+            summaries = sim_state.analytics.statistics.get_all_summaries(hours)
+
+            return jsonify({
+                'period_hours': hours,
+                'uptime_pct': sim_state.analytics.statistics.get_uptime_pct(),
+                'metrics': {
+                    name: {
+                        'count': s.count,
+                        'mean': s.mean,
+                        'std': s.std,
+                        'min': s.min,
+                        'max': s.max,
+                        'trend': s.trend
+                    }
+                    for name, s in summaries.items()
+                }
+            })
+        except Exception as e:
+            logger.error("Error getting statistics: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/update', methods=['POST'])
+    def update_analytics():
+        """Update analytics with current simulation data."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            # Get current state from physics model
+            state = sim_state.model.get_state()
+            target_flow = sim_state.target_flow
+
+            # Build analytics data
+            total_flow = float(np.sum(state['flows']))
+            max_vibration = float(np.max(state['vibrations']))
+            flow_error = abs(total_flow - target_flow) / target_flow * 100 if target_flow > 0 else 0
+
+            analytics_data = {
+                'total_flow': total_flow,
+                'target_flow': target_flow,
+                'flow_error': flow_error,
+                'max_vibration': max_vibration
+            }
+
+            result = sim_state.analytics.update(analytics_data)
+            return jsonify(result)
+        except Exception as e:
+            logger.error("Error updating analytics: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/analytics/status')
+    def get_analytics_status():
+        """Get analytics engine status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.analytics.get_status()
+            return jsonify(status)
+        except Exception as e:
+            logger.error("Error getting analytics status: %s", e)
             return jsonify({'error': str(e)}), 500
 
     return app
