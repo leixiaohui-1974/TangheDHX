@@ -55,6 +55,11 @@ from src.analytics.reporting import (
     AlarmSeverity,
     AlarmCategory
 )
+from src.streaming.realtime import (
+    RealTimeDataHub,
+    EventType,
+    EventPriority
+)
 from datetime import datetime
 
 # Configure logging
@@ -165,6 +170,11 @@ class SimulationState:
         # Analytics and reporting engine
         self.analytics = AnalyticsEngine(history_hours=720)  # 30 days history
 
+        # Real-time data streaming hub
+        self.data_hub = RealTimeDataHub(aggregation_interval_ms=1000)
+        self.data_hub.start()
+        self._init_data_streams()
+
         logger.info("SimulationState initialized with full feature set including extended modules")
 
     def _init_maintenance_equipment(self) -> None:
@@ -207,6 +217,20 @@ class SimulationState:
                 sensor_info,
                 ExponentialDegradation(failure_rate=0.00003, degradation_rate=0.001)
             )
+
+    def _init_data_streams(self) -> None:
+        """Initialize real-time data streams."""
+        # Register main streams
+        self.data_hub.register_stream('total_flow', unit='m³/s')
+        self.data_hub.register_stream('head_upstream', unit='m')
+        self.data_hub.register_stream('head_downstream', unit='m')
+        self.data_hub.register_stream('target_flow', unit='m³/s')
+
+        # Gate streams
+        for i in range(3):
+            self.data_hub.register_stream(f'gate_{i}_opening', unit='%')
+            self.data_hub.register_stream(f'gate_{i}_flow', unit='m³/s')
+            self.data_hub.register_stream(f'gate_{i}_vibration', unit='mm/s')
 
     def _init_data_series(self) -> None:
         """Initialize data series for storage."""
@@ -378,7 +402,7 @@ class SimulationState:
             self._check_anomalies()
 
     def _record_data(self) -> None:
-        """Record current state to data storage."""
+        """Record current state to data storage and streaming hub."""
         ts = time.time()
         state = self.model.get_state()
 
@@ -404,6 +428,20 @@ class SimulationState:
         self.data_storage.write('target_flow', ts, self._target_flow)
         self.data_storage.write('flow_error', ts,
                                 abs(state['total_flow'] - self._target_flow))
+
+        # Publish to real-time streaming hub
+        stream_data = {
+            'total_flow': state['total_flow'],
+            'head_upstream': state['head_upstream'],
+            'head_downstream': state['head_downstream'],
+            'target_flow': self._target_flow
+        }
+        for i in range(3):
+            stream_data[f'gate_{i}_opening'] = state['gate_openings'][i] * 100
+            stream_data[f'gate_{i}_flow'] = state['gate_flows'][i]
+            stream_data[f'gate_{i}_vibration'] = state['vibrations'][i]
+
+        self.data_hub.publish('simulation', stream_data)
 
     def _check_anomalies(self) -> None:
         """Check for anomalies in current data."""
@@ -2098,6 +2136,185 @@ def create_app() -> Flask:
             return jsonify(status)
         except Exception as e:
             logger.error("Error getting analytics status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Real-Time Data Streaming API Endpoints
+    # =========================================================================
+
+    @app.route('/api/streaming/status')
+    def get_streaming_status():
+        """Get streaming hub status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.data_hub.get_status()
+            return jsonify(status)
+        except Exception as e:
+            logger.error("Error getting streaming status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/latest')
+    def get_streaming_latest():
+        """Get latest values from all streams."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            latest = sim_state.data_hub.get_all_latest()
+            return jsonify({'latest': latest})
+        except Exception as e:
+            logger.error("Error getting latest streaming data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/latest/<stream_name>')
+    def get_stream_latest(stream_name: str):
+        """Get latest value for a specific stream."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            value = sim_state.data_hub.get_latest(stream_name)
+            if value is None:
+                return jsonify({'error': f'Stream {stream_name} not found'}), 404
+            return jsonify({'stream': stream_name, 'value': value})
+        except Exception as e:
+            logger.error("Error getting stream latest: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/aggregated')
+    def get_streaming_aggregated():
+        """Get aggregated data from all streams."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            aggregated = sim_state.data_hub.get_aggregated()
+            result = {}
+            for name, agg in aggregated.items():
+                result[name] = {
+                    'values': agg.values,
+                    'sample_count': agg.sample_count,
+                    'unit': agg.unit
+                }
+            return jsonify({'aggregated': result})
+        except Exception as e:
+            logger.error("Error getting aggregated streaming data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/aggregated/<stream_name>')
+    def get_stream_aggregated(stream_name: str):
+        """Get aggregated data for a specific stream."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            agg = sim_state.data_hub.get_aggregated(stream_name)
+            if agg is None:
+                return jsonify({'error': f'Stream {stream_name} not found'}), 404
+            return jsonify({
+                'stream': stream_name,
+                'values': agg.values,
+                'sample_count': agg.sample_count,
+                'unit': agg.unit
+            })
+        except Exception as e:
+            logger.error("Error getting stream aggregated: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/subscribe', methods=['POST'])
+    def create_streaming_subscription():
+        """Create a new streaming subscription."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            subscriber_id = data.get('subscriber_id')
+            if not subscriber_id:
+                return jsonify({'error': 'subscriber_id is required'}), 400
+
+            # Parse event types
+            event_type_strs = data.get('event_types', ['DATA_UPDATE'])
+            event_types = []
+            for et in event_type_strs:
+                try:
+                    event_types.append(EventType[et])
+                except KeyError:
+                    pass
+            if not event_types:
+                event_types = [EventType.DATA_UPDATE]
+
+            sub = sim_state.data_hub.subscribe(
+                subscriber_id=subscriber_id,
+                event_types=event_types
+            )
+
+            return jsonify({
+                'status': 'ok',
+                'subscription_id': sub.subscription_id,
+                'subscriber_id': sub.subscriber_id
+            })
+        except Exception as e:
+            logger.error("Error creating subscription: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/unsubscribe', methods=['POST'])
+    def cancel_streaming_subscription():
+        """Cancel a streaming subscription."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            subscription_id = data.get('subscription_id')
+            if not subscription_id:
+                return jsonify({'error': 'subscription_id is required'}), 400
+
+            success = sim_state.data_hub.unsubscribe(subscription_id)
+            if success:
+                return jsonify({'status': 'ok', 'message': f'Subscription {subscription_id} cancelled'})
+            else:
+                return jsonify({'error': f'Subscription {subscription_id} not found'}), 404
+        except Exception as e:
+            logger.error("Error cancelling subscription: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/event_bus')
+    def get_event_bus_stats():
+        """Get event bus statistics."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            stats = sim_state.data_hub.event_bus.get_stats()
+            return jsonify(stats)
+        except Exception as e:
+            logger.error("Error getting event bus stats: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/streaming/publish', methods=['POST'])
+    def publish_streaming_data():
+        """Publish data to the streaming hub."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            source = data.get('source', 'api')
+            payload = data.get('data', {})
+
+            if not payload:
+                return jsonify({'error': 'data is required'}), 400
+
+            # Convert payload values to floats
+            float_payload = {k: float(v) for k, v in payload.items()}
+            sim_state.data_hub.publish(source, float_payload)
+
+            return jsonify({'status': 'ok', 'message': 'Data published'})
+        except Exception as e:
+            logger.error("Error publishing streaming data: %s", e)
             return jsonify({'error': str(e)}), 500
 
     return app
