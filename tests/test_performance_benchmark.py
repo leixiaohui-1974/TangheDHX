@@ -166,16 +166,17 @@ class TestPIDPerformance:
     @pytest.fixture
     def pid(self):
         """Create PID controller."""
-        return MultiChannelPID(num_channels=3)
+        return MultiChannelPID(num_gates=3)
 
     def test_pid_update(self, pid):
-        """Test PID update time."""
-        setpoints = [0.5, 0.5, 0.5]
-        measurements = [0.48, 0.52, 0.50]
+        """Test PID compute time."""
+        target_flow = 100.0
+        current_flows = np.array([30.0, 35.0, 33.0])
+        current_velocities = np.array([2.0, 2.2, 2.1])
         dt = 0.1
 
         def update_func():
-            pid.update(setpoints, measurements, dt)
+            pid.compute(target_flow, current_flows, current_velocities, dt)
 
         mean_ms, std_ms, max_ms = measure_execution_time(update_func)
 
@@ -216,7 +217,7 @@ class TestIntegratedControllerPerformance:
             ScenarioType.NORMAL_LOW_FLOW,
             ScenarioType.RESONANCE_CROSSING,
             ScenarioType.NORMAL_HIGH_FLOW,
-            ScenarioType.EMERGENCY_GATE_FAULT,
+            ScenarioType.GATE_STUCK,
         ]
 
         times = []
@@ -252,7 +253,7 @@ class TestScenarioDetectorPerformance:
     def test_detection_performance(self, detector):
         """Test scenario detection time."""
         def detect_func():
-            detector.detect()
+            detector.update(0.1)
 
         mean_ms, std_ms, max_ms = measure_execution_time(detect_func)
 
