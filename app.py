@@ -68,6 +68,13 @@ from src.scenarios.generator import (
     ScenarioCategory,
     ScenarioSeverity
 )
+from src.twin_sync.synchronizer import (
+    TwinSyncManager,
+    SyncMode,
+    SyncStatus,
+    SyncQuality,
+    SourceType
+)
 from datetime import datetime
 
 # Configure logging
@@ -192,6 +199,13 @@ class SimulationState:
         )
         self._current_scenario_result: Optional[Dict] = None
 
+        # Digital twin synchronization system
+        self.twin_sync = TwinSyncManager(
+            self.model,
+            config={'mode': 'ON_DEMAND', 'sync_interval_ms': 100.0}
+        )
+        self._init_sync_sources()
+
         logger.info("SimulationState initialized with full feature set including extended modules")
 
     def _init_maintenance_equipment(self) -> None:
@@ -303,6 +317,60 @@ class SimulationState:
                 max_rate=20,
                 window=5.0,
             ))
+
+    def _init_sync_sources(self) -> None:
+        """Initialize data sources for digital twin synchronization."""
+        # Register flow sensors
+        self.twin_sync.add_physical_source(
+            source_id='adcp_upstream',
+            name='ADCP Upstream Sensor',
+            variables=['total_flow', 'velocity'],
+            source_type=SourceType.PHYSICAL_SENSOR,
+            sample_rate_hz=1.0,
+            latency_ms=100.0,
+            reliability=0.98,
+            accuracy=0.95
+        )
+
+        # Register water level sensors
+        self.twin_sync.add_physical_source(
+            source_id='level_upstream',
+            name='Water Level Upstream',
+            variables=['head_upstream'],
+            source_type=SourceType.PHYSICAL_SENSOR,
+            sample_rate_hz=10.0,
+            latency_ms=50.0,
+            reliability=0.99,
+            accuracy=0.98
+        )
+
+        self.twin_sync.add_physical_source(
+            source_id='level_downstream',
+            name='Water Level Downstream',
+            variables=['head_downstream'],
+            source_type=SourceType.PHYSICAL_SENSOR,
+            sample_rate_hz=10.0,
+            latency_ms=50.0,
+            reliability=0.99,
+            accuracy=0.98
+        )
+
+        # Register SCADA system
+        self.twin_sync.add_physical_source(
+            source_id='scada',
+            name='SCADA System',
+            variables=['gate_0_position', 'gate_1_position', 'gate_2_position'],
+            source_type=SourceType.SCADA,
+            sample_rate_hz=1.0,
+            latency_ms=200.0,
+            reliability=0.999,
+            accuracy=0.99
+        )
+
+        # Set discrepancy thresholds
+        self.twin_sync.set_discrepancy_threshold('total_flow', 0.05)  # 5%
+        self.twin_sync.set_discrepancy_threshold('head_upstream', 0.02)  # 2%
+        self.twin_sync.set_discrepancy_threshold('head_downstream', 0.02)  # 2%
 
     @property
     def running(self) -> bool:
@@ -2715,6 +2783,239 @@ def create_app() -> Flask:
             })
         except Exception as e:
             logger.error("Error getting scenario categories: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Digital Twin Synchronization API Endpoints
+    # =========================================================================
+
+    @app.route('/api/twin_sync/status')
+    def get_twin_sync_status():
+        """Get digital twin synchronization status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.twin_sync.get_status()
+            return jsonify(status)
+        except Exception as e:
+            logger.error("Error getting twin sync status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/sync', methods=['POST'])
+    def sync_twin():
+        """Trigger synchronization."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            result = sim_state.twin_sync.sync_now()
+            return jsonify({
+                'status': 'ok',
+                'state': {
+                    'timestamp': result.timestamp,
+                    'values': result.values,
+                    'uncertainties': result.uncertainties,
+                    'confidence': result.confidence,
+                    'quality': result.quality.name
+                }
+            })
+        except Exception as e:
+            logger.error("Error during sync: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/update', methods=['POST'])
+    def update_physical_state():
+        """Update with physical measurement data."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            source_id = data.get('source_id')
+            state = data.get('state', {})
+
+            if not source_id:
+                return jsonify({'error': 'source_id is required'}), 400
+            if not state:
+                return jsonify({'error': 'state data is required'}), 400
+
+            result = sim_state.twin_sync.update_physical_state(source_id, state)
+
+            return jsonify({
+                'status': 'ok',
+                'result': {
+                    'timestamp': result.timestamp,
+                    'values': result.values,
+                    'confidence': result.confidence,
+                    'quality': result.quality.name
+                }
+            })
+        except Exception as e:
+            logger.error("Error updating physical state: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/sources')
+    def get_sync_sources():
+        """Get registered synchronization sources."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.twin_sync.get_status()
+            return jsonify({
+                'sources': status['sources']
+            })
+        except Exception as e:
+            logger.error("Error getting sync sources: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/sources', methods=['POST'])
+    def add_sync_source():
+        """Add a new synchronization source."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            source_id = data.get('source_id')
+            name = data.get('name')
+            variables = data.get('variables', [])
+            source_type = data.get('source_type', 'PHYSICAL_SENSOR')
+
+            if not source_id or not name:
+                return jsonify({'error': 'source_id and name are required'}), 400
+
+            try:
+                st = SourceType[source_type.upper()]
+            except KeyError:
+                return jsonify({'error': f'Invalid source_type: {source_type}'}), 400
+
+            sim_state.twin_sync.add_physical_source(
+                source_id=source_id,
+                name=name,
+                variables=variables,
+                source_type=st,
+                sample_rate_hz=data.get('sample_rate_hz', 1.0),
+                latency_ms=data.get('latency_ms', 50.0),
+                reliability=data.get('reliability', 0.99),
+                accuracy=data.get('accuracy', 0.98)
+            )
+
+            return jsonify({'status': 'ok', 'message': f'Source {source_id} added'})
+        except Exception as e:
+            logger.error("Error adding sync source: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/discrepancies')
+    def get_sync_discrepancies():
+        """Get active discrepancies between physical and digital states."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            discrepancies = sim_state.twin_sync.get_discrepancies()
+            return jsonify({
+                'count': len(discrepancies),
+                'discrepancies': [
+                    {
+                        'event_id': d.event_id,
+                        'timestamp': d.timestamp,
+                        'variable': d.variable,
+                        'physical_value': d.physical_value,
+                        'digital_value': d.digital_value,
+                        'discrepancy_pct': d.discrepancy_pct,
+                        'severity': d.severity,
+                        'resolved': d.resolved
+                    }
+                    for d in discrepancies
+                ]
+            })
+        except Exception as e:
+            logger.error("Error getting discrepancies: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/discrepancies/resolve', methods=['POST'])
+    def resolve_sync_discrepancy():
+        """Resolve a discrepancy."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            variable = data.get('variable')
+            use_physical = data.get('use_physical', True)
+
+            if not variable:
+                return jsonify({'error': 'variable is required'}), 400
+
+            result = sim_state.twin_sync.resolve_discrepancy(variable, use_physical)
+            return jsonify({
+                'status': 'ok' if result else 'not_found',
+                'resolved': result
+            })
+        except Exception as e:
+            logger.error("Error resolving discrepancy: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/state')
+    def get_synchronized_state():
+        """Get current synchronized state."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            state = sim_state.twin_sync.get_synchronized_state()
+            return jsonify({
+                'state': state
+            })
+        except Exception as e:
+            logger.error("Error getting synchronized state: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/history/<variable>')
+    def get_sync_history(variable: str):
+        """Get fusion history for a variable."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            duration = request.args.get('duration', 60.0, type=float)
+            history = sim_state.twin_sync.get_fusion_history(variable, duration)
+            return jsonify({
+                'variable': variable,
+                'duration_seconds': duration,
+                'count': len(history),
+                'data': [
+                    {'timestamp': ts, 'value': val}
+                    for ts, val in history
+                ]
+            })
+        except Exception as e:
+            logger.error("Error getting sync history: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/twin_sync/threshold', methods=['POST'])
+    def set_sync_threshold():
+        """Set discrepancy threshold for a variable."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            variable = data.get('variable')
+            threshold = data.get('threshold')
+
+            if not variable or threshold is None:
+                return jsonify({'error': 'variable and threshold are required'}), 400
+
+            sim_state.twin_sync.set_discrepancy_threshold(variable, float(threshold))
+            return jsonify({
+                'status': 'ok',
+                'message': f'Threshold for {variable} set to {threshold}'
+            })
+        except Exception as e:
+            logger.error("Error setting threshold: %s", e)
             return jsonify({'error': str(e)}), 500
 
     return app
