@@ -16,6 +16,7 @@ Features:
 import logging
 import threading
 import time
+import numpy as np
 from typing import Any, Dict, Optional, Tuple, List
 
 from flask import Flask, jsonify, render_template, request
@@ -41,6 +42,13 @@ from src.data.anomaly import AnomalyDetector, ThresholdRule, RateRule, Severity
 from src.data.replay import HistoryReplay, ReplayMode
 from src.data.governance import DataGovernanceEngine
 from src.data.assimilation import DataAssimilationEngine
+from src.maintenance.predictive_maintenance import (
+    PredictiveMaintenanceSystem,
+    EquipmentInfo,
+    WeibullDegradation,
+    ExponentialDegradation
+)
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -139,7 +147,56 @@ class SimulationState:
         # Real-time state prediction
         self.state_predictor = RealTimeStatePredictor(self.model)
 
+        # Predictive maintenance system
+        self.maintenance_system = PredictiveMaintenanceSystem(
+            failure_threshold=30.0,
+            warning_threshold=50.0,
+            planning_horizon_days=30
+        )
+        self._init_maintenance_equipment()
+
         logger.info("SimulationState initialized with full feature set including extended modules")
+
+    def _init_maintenance_equipment(self) -> None:
+        """Initialize equipment for predictive maintenance monitoring."""
+        installation_date = datetime(2020, 1, 1)
+
+        # Register gates
+        for i in range(3):
+            gate_info = EquipmentInfo(
+                equipment_id=f"gate_{i}",
+                equipment_type="gate",
+                installation_date=installation_date,
+                manufacturer="Tanghe Engineering",
+                model="TG-600",
+                expected_lifetime_hours=50000.0,
+                maintenance_interval_hours=2000.0,
+                replacement_cost=15000.0,
+                downtime_cost_per_hour=800.0
+            )
+            self.maintenance_system.register_equipment(
+                gate_info,
+                WeibullDegradation(shape=2.5, scale=50000.0)
+            )
+
+        # Register sensors
+        sensor_types = ['flow', 'pressure', 'velocity', 'water_level']
+        for i, sensor_type in enumerate(sensor_types):
+            sensor_info = EquipmentInfo(
+                equipment_id=f"sensor_{sensor_type}",
+                equipment_type="sensor",
+                installation_date=installation_date,
+                manufacturer="Tanghe Instruments",
+                model=f"TS-{sensor_type.upper()}",
+                expected_lifetime_hours=30000.0,
+                maintenance_interval_hours=1000.0,
+                replacement_cost=2000.0,
+                downtime_cost_per_hour=200.0
+            )
+            self.maintenance_system.register_equipment(
+                sensor_info,
+                ExponentialDegradation(failure_rate=0.00003, degradation_rate=0.001)
+            )
 
     def _init_data_series(self) -> None:
         """Initialize data series for storage."""
@@ -1603,6 +1660,185 @@ def create_app() -> Flask:
             })
         except Exception as e:
             logger.error("Error getting alerts: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Predictive Maintenance API Endpoints
+    # =========================================================================
+
+    @app.route('/api/maintenance/status')
+    def get_maintenance_status():
+        """Get overall predictive maintenance system status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.maintenance_system.get_system_status()
+            return jsonify(status)
+        except Exception as e:
+            logger.error("Error getting maintenance status: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/maintenance/equipment')
+    def get_equipment_list():
+        """Get list of monitored equipment with health status."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            status = sim_state.maintenance_system.get_system_status()
+            equipment = []
+            for eq_id, eq_status in status.get('equipment_status', {}).items():
+                equipment.append({
+                    'equipment_id': eq_id,
+                    'health': eq_status['health'],
+                    'status': eq_status['status'],
+                    'operating_hours': eq_status['operating_hours'],
+                    'rul_hours': eq_status['rul_hours'],
+                    'failure_probability': eq_status['failure_probability']
+                })
+            return jsonify({
+                'count': len(equipment),
+                'equipment': equipment
+            })
+        except Exception as e:
+            logger.error("Error getting equipment list: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/maintenance/equipment/<equipment_id>')
+    def get_equipment_details(equipment_id):
+        """Get detailed report for specific equipment."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            report = sim_state.maintenance_system.get_equipment_report(equipment_id)
+            if report is None:
+                return jsonify({'error': f'Equipment {equipment_id} not found'}), 404
+            return jsonify(report)
+        except Exception as e:
+            logger.error("Error getting equipment details: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/maintenance/predictions')
+    def get_failure_predictions():
+        """Get failure predictions for all equipment."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            predictions = sim_state.maintenance_system.predict_failures()
+            result = {}
+            for eq_id, eq_predictions in predictions.items():
+                result[eq_id] = [
+                    {
+                        'failure_mode': p.failure_mode.value,
+                        'probability': p.probability,
+                        'time_to_failure_hours': p.time_to_failure_hours,
+                        'confidence': p.confidence,
+                        'contributing_factors': p.contributing_factors,
+                        'recommended_actions': p.recommended_actions
+                    }
+                    for p in eq_predictions
+                ]
+            return jsonify({
+                'equipment_count': len(result),
+                'predictions': result
+            })
+        except Exception as e:
+            logger.error("Error getting failure predictions: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/maintenance/plan')
+    def get_maintenance_plan():
+        """Get optimized maintenance plan."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            plan = sim_state.maintenance_system.generate_maintenance_plan()
+            actions = [
+                {
+                    'equipment_id': a.equipment_id,
+                    'action_type': a.action_type.value,
+                    'priority': a.priority.name,
+                    'description': a.description,
+                    'estimated_duration_hours': a.estimated_duration_hours,
+                    'estimated_cost': a.estimated_cost,
+                    'due_date': a.due_date.isoformat(),
+                    'risk_if_delayed': a.risk_if_delayed
+                }
+                for a in plan
+            ]
+            cost_summary = sim_state.maintenance_system.scheduler.get_cost_summary()
+            return jsonify({
+                'plan': actions,
+                'summary': cost_summary
+            })
+        except Exception as e:
+            logger.error("Error generating maintenance plan: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/maintenance/update', methods=['POST'])
+    def update_maintenance_data():
+        """Update maintenance system with new sensor data."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            timestamp = data.get('timestamp', time.time() / 3600)  # Default to current hour
+
+            # Get current state from physics model
+            state = sim_state.model.get_state()
+
+            # Build sensor data for maintenance update
+            sensor_data = {}
+            for i in range(3):
+                sensor_data[f'gate_{i}'] = {
+                    'vibration': state['vibrations'][i] if i < len(state['vibrations']) else 0.0,
+                    'temperature': 25.0 + np.random.normal(0, 2),  # Simulated
+                    'performance_metric': 90.0 - state['vibrations'][i] * 5
+                }
+
+            # Add sensors
+            sensor_data['sensor_flow'] = {'performance_metric': 95.0}
+            sensor_data['sensor_pressure'] = {'performance_metric': 95.0}
+            sensor_data['sensor_velocity'] = {'performance_metric': 95.0}
+            sensor_data['sensor_water_level'] = {'performance_metric': 95.0}
+
+            result = sim_state.maintenance_system.update(timestamp, sensor_data)
+            return jsonify(result)
+        except Exception as e:
+            logger.error("Error updating maintenance data: %s", e)
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/maintenance/record', methods=['POST'])
+    def record_maintenance_action():
+        """Record that maintenance was performed on equipment."""
+        if sim_state is None:
+            return jsonify({'error': 'Simulation not initialized'}), 500
+
+        try:
+            data = request.get_json() or {}
+            equipment_id = data.get('equipment_id')
+
+            if not equipment_id:
+                return jsonify({'error': 'equipment_id is required'}), 400
+
+            if equipment_id not in sim_state.maintenance_system._monitors:
+                return jsonify({'error': f'Equipment {equipment_id} not found'}), 404
+
+            monitor = sim_state.maintenance_system._monitors[equipment_id]
+            monitor.record_maintenance(datetime.now())
+
+            return jsonify({
+                'status': 'success',
+                'message': f'Maintenance recorded for {equipment_id}',
+                'new_health': monitor._current_health.overall
+            })
+        except Exception as e:
+            logger.error("Error recording maintenance: %s", e)
             return jsonify({'error': str(e)}), 500
 
     return app
